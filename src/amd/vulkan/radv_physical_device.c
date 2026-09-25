@@ -67,6 +67,12 @@ radv_taskmesh_enabled(const struct radv_physical_device *pdev)
 {
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
 
+   /* Samsung's Vulkan 24.2.2 capability profile for Xclipse 940 reports
+    * mesh/task shaders unsupported. Don't inherit desktop GFX10.3 enablement.
+    */
+   if (pdev->info.is_xclipse940)
+      return false;
+
    if (instance->debug_flags & RADV_DEBUG_NO_MESH_SHADER)
       return false;
 
@@ -132,6 +138,13 @@ static VkConformanceVersion
 radv_get_conformance_version(const struct radv_physical_device *pdev)
 {
    VkConformanceVersion conformance_version = {0}; /* Non-conformant by default */
+
+   /* This experimental MGFX2 port has not passed Vulkan CTS.  Reusing
+    * Vangogh's conformance version would be misleading even though the
+    * proprietary Samsung driver itself is conformant.
+    */
+   if (pdev->info.is_xclipse940)
+      return conformance_version;
 
    if (pdev->info.gfx_level == GFX10_3) {
       conformance_version = (VkConformanceVersion){
@@ -348,7 +361,13 @@ radv_physical_device_init_mem_types(struct radv_physical_device *pdev)
    if (!pdev->info.has_dedicated_vram) {
       const uint64_t total_size = gtt_size + visible_vram_size;
 
-      if (instance->drirc.enable_unified_heap_on_apu) {
+      if (pdev->info.is_xclipse940) {
+         /* Xclipse 940 is true UMA.  Samsung's Vulkan driver exposes the
+          * large shared heap plus the small carveout separately.  Preserve
+          * the kernel/libdrm-reported GTT and visible carveout instead of
+          * applying RADV's desktop-APU 2/3 : 1/3 reporting heuristic.
+          */
+      } else if (instance->drirc.enable_unified_heap_on_apu) {
          /* Some applications seem better when the driver exposes only one heap of VRAM on APUs. */
          visible_vram_size = total_size;
          gtt_size = 0;
@@ -380,7 +399,10 @@ radv_physical_device_init_mem_types(struct radv_physical_device *pdev)
       pdev->heaps |= RADV_HEAP_GTT;
       pdev->memory_properties.memoryHeaps[gart_index] = (VkMemoryHeap){
          .size = gtt_size,
-         .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT, // Forțează heap-ul GTT să fie local
+         /* Shared system memory is device-local for SGPU/UMA, but don't
+          * leak this experimental SGPU policy to regular discrete AMD GPUs.
+          */
+         .flags = pdev->info.is_sgpu ? VK_MEMORY_HEAP_DEVICE_LOCAL_BIT : 0,
       };
    }
 
@@ -683,7 +705,7 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .EXT_mutable_descriptor_type = true, /* Trivial promotion from VALVE. */
       .EXT_nested_command_buffer = true,
       .EXT_non_seamless_cube_map = true,
-      .EXT_pci_bus_info = true,
+      .EXT_pci_bus_info = pdev->info.pci.valid,
 #ifndef _WIN32
       .EXT_physical_device_drm = true,
 #endif
@@ -1286,6 +1308,33 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       .deviceGeneratedCommands = true,
       .dynamicGeneratedPipelineLayout = true,
    };
+
+   if (pdev->info.is_xclipse940) {
+      /* Verified against Samsung Vulkan 24.2.2 on Xclipse 940.
+       *
+       * The mobile MGFX2 capability profile does not expose general FP64,
+       * mesh shaders, or cooperative matrices.  Keep RADV from inheriting
+       * desktop-Vangogh assumptions merely because ACO uses the GFX10.3
+       * instruction/register path.
+       */
+      features->shaderFloat64 = false;
+
+      features->shaderBufferFloat64Atomics = false;
+      features->shaderBufferFloat64AtomicAdd = false;
+      features->shaderSharedFloat64Atomics = false;
+      features->shaderSharedFloat64AtomicAdd = false;
+      features->shaderBufferFloat64AtomicMinMax = false;
+      features->shaderSharedFloat64AtomicMinMax = false;
+
+      features->meshShader = false;
+      features->taskShader = false;
+      features->multiviewMeshShader = false;
+      features->primitiveFragmentShadingRateMeshShader = false;
+      features->meshShaderQueries = false;
+
+      features->cooperativeMatrix = false;
+      features->cooperativeMatrixRobustBufferAccess = false;
+   }
 }
 
 static size_t
@@ -1347,7 +1396,11 @@ radv_get_compiler_string(struct radv_physical_device *pdev)
 static void
 radv_get_physical_device_properties(struct radv_physical_device *pdev)
 {
-   VkSampleCountFlags sample_counts = 0xf;
+   /* Samsung's Xclipse 940 Vulkan profile exposes MSAA up to 4x. */
+   VkSampleCountFlags sample_counts =
+      pdev->info.is_xclipse940
+         ? (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT)
+         : 0xf;
 
    size_t max_descriptor_set_size = radv_max_descriptor_set_size();
 
@@ -1366,13 +1419,16 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
       .apiVersion = RADV_API_VERSION,
       .driverVersion = vk_get_driver_version(),
       .vendorID = ATI_VENDOR_ID,
-      .deviceID = pdev->info.pci_id,
+      /* Match the device ID exposed by Samsung's proprietary Xclipse 940
+       * Vulkan driver without changing RADV's internal CHIP_VANGOGH backend.
+       */
+      .deviceID = pdev->info.is_xclipse940 ? 0x02600200 : pdev->info.pci_id,
       .deviceType = device_type,
       .maxImageDimension1D = (1 << 14),
       .maxImageDimension2D = (1 << 14),
-      .maxImageDimension3D = (1 << 11),
+      .maxImageDimension3D = pdev->info.is_xclipse940 ? (1 << 13) : (1 << 11),
       .maxImageDimensionCube = (1 << 14),
-      .maxImageArrayLayers = (1 << 11),
+      .maxImageArrayLayers = pdev->info.is_xclipse940 ? (1 << 13) : (1 << 11),
       .maxTexelBufferElements = UINT32_MAX,
       .maxUniformBufferRange = UINT32_MAX,
       .maxStorageBufferRange = UINT32_MAX,
@@ -1482,7 +1538,11 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
    struct vk_properties *p = &pdev->vk.properties;
 
    /* Vulkan 1.1 */
-   strcpy(p->deviceName, pdev->marketing_name);
+   if (pdev->info.is_xclipse940)
+      strcpy(p->deviceName, "Samsung Xclipse 940 (RADV)");
+   else
+      strcpy(p->deviceName, pdev->marketing_name);
+
    memcpy(p->pipelineCacheUUID, pdev->cache_uuid, VK_UUID_SIZE);
 
    memcpy(p->deviceUUID, pdev->device_uuid, VK_UUID_SIZE);
@@ -2059,7 +2119,11 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
    if (drm_device) {
       bool reserve_vmid = instance->vk.trace_mode & RADV_TRACE_MODE_RGP;
 
+      fprintf(stderr, "x940: creating amdgpu winsys\n");
+
       pdev->ws = radv_amdgpu_winsys_create(fd, instance->debug_flags, instance->perftest_flags, reserve_vmid);
+
+      fprintf(stderr, "x940: winsys = %p\n", (void *)pdev->ws);
    } else {
       pdev->ws = radv_null_winsys_create();
    }
@@ -2095,7 +2159,16 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
    pdev->ws->query_info(pdev->ws, &pdev->info);
 
    if (drm_device) {
+      fprintf(stderr,
+              "x940: addrlib family=%u rev=0x%x gfx=%d\n",
+              pdev->info.family_id,
+              pdev->info.chip_external_rev,
+              pdev->info.gfx_level);
+
       pdev->addrlib = ac_addrlib_create(&pdev->info, &pdev->info.max_alignment);
+
+      fprintf(stderr, "x940: addrlib = %p\n", (void *)pdev->addrlib);
+
       if (!pdev->addrlib) {
          result = VK_ERROR_INITIALIZATION_FAILED;
          goto fail_wsi;
@@ -2199,7 +2272,12 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
       struct stat primary_stat = {0}, render_stat = {0};
 
       pdev->available_nodes = drm_device->available_nodes;
-      pdev->bus_info = *drm_device->businfo.pci;
+
+      if (drm_device->bustype == DRM_BUS_PCI && drm_device->businfo.pci) {
+         pdev->bus_info = *drm_device->businfo.pci;
+      } else {
+         memset(&pdev->bus_info, 0, sizeof(pdev->bus_info));
+      }
 
       if ((drm_device->available_nodes & (1 << DRM_NODE_PRIMARY)) &&
           stat(drm_device->nodes[DRM_NODE_PRIMARY], &primary_stat) != 0) {

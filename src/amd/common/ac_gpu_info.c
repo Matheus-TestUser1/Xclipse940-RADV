@@ -24,6 +24,21 @@
 #define AMDGPU_MI200_RANGE       0x3C, 0x46
 #define AMDGPU_GFX940_RANGE      0x46, 0xFF
 
+/* Samsung SGPU family used by Xclipse 930/940-class mobile GPUs.
+ * The S5E9945 kernel defines AMDGPU_FAMILY_MGFX as 147.
+ *
+ * GRBM_CHIP_REVISION:
+ *   [31:24] generation
+ *   [23:16] model (0x60 = Premium)
+ *   [15:8]  EVT/major revision
+ *   [7:0]   minor revision
+ */
+#define SGPU_FAMILY_MGFX         147
+#define SGPU_MGFX_GEN(r)         (((r) >> 24) & 0xff)
+#define SGPU_MGFX_MODEL(r)       (((r) >> 16) & 0xff)
+#define SGPU_MGFX_MODEL_PREMIUM  0x60
+#define SGPU_MGFX_GEN_XCLIPSE940 2
+
 #define ASICREV_IS_MI100(r)      ASICREV_IS(r, MI100)
 #define ASICREV_IS_MI200(r)      ASICREV_IS(r, MI200)
 #define ASICREV_IS_GFX940(r)     ASICREV_IS(r, GFX940)
@@ -562,17 +577,25 @@ static void set_custom_cu_en_mask(struct radeon_info *info)
    }
 }
 
-static bool ac_query_pci_bus_info(int fd, struct radeon_info *info)
+static bool
+ac_query_pci_bus_info(int fd, struct radeon_info *info)
 {
    drmDevicePtr devinfo;
 
-   /* Get PCI info. */
    int r = drmGetDevice2(fd, 0, &devinfo);
    if (r) {
       fprintf(stderr, "amdgpu: drmGetDevice2 failed.\n");
       info->pci.valid = false;
       return false;
    }
+
+   if (devinfo->bustype != DRM_BUS_PCI || !devinfo->businfo.pci) {
+      /* SGPU/Xclipse is a platform DRM device, not PCI. */
+      info->pci.valid = false;
+      drmFreeDevice(&devinfo);
+      return true;
+   }
+
    info->pci.domain = devinfo->businfo.pci->domain;
    info->pci.bus = devinfo->businfo.pci->bus;
    info->pci.dev = devinfo->businfo.pci->dev;
@@ -665,6 +688,16 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
       return false;
    }
 
+   /* Samsung's SGPU kernel reports FAMILY_MGFX for the mobile RDNA path.
+    * Xclipse 940 is MGFX2, Premium model 0x60. Do this before generic AMD
+    * family decoding so we can keep Samsung-specific workarounds scoped.
+    */
+   info->is_sgpu = device_info.family == SGPU_FAMILY_MGFX;
+   info->is_xclipse940 =
+      info->is_sgpu &&
+      SGPU_MGFX_MODEL(device_info.external_rev) == SGPU_MGFX_MODEL_PREMIUM &&
+      SGPU_MGFX_GEN(device_info.external_rev) == SGPU_MGFX_GEN_XCLIPSE940;
+
    r = amdgpu_query_buffer_size_alignment(dev, &alignment_info);
    if (r) {
       fprintf(stderr, "amdgpu: amdgpu_query_buffer_size_alignment failed.\n");
@@ -700,6 +733,18 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
                   device_info.family == FAMILY_MDN)
             info->ip[AMD_IP_GFX].ver_minor = info->ip[AMD_IP_COMPUTE].ver_minor = 3;
       }
+
+      /* S5E9945/Xclipse 940 is Samsung MGFX2. Samsung's kernel ABI is based
+       * on the GFX10.3/Vangogh-lite command stream, but some SGPU revisions
+       * don't expose the same IP discovery tuple as desktop AMDGPU.
+       * Normalize only the identified 940 instead of overriding every GPU.
+       */
+      if (info->is_xclipse940 &&
+          (ip_type == AMD_IP_GFX || ip_type == AMD_IP_COMPUTE)) {
+         info->ip[ip_type].ver_major = 10;
+         info->ip[ip_type].ver_minor = 3;
+      }
+
       info->ip[ip_type].num_queues = util_bitcount(ip_info.available_rings);
 
       /* query ip count */
@@ -880,6 +925,15 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
          identify_chip(NAVI23);
          identify_chip(NAVI24);
          break;
+      case SGPU_FAMILY_MGFX:
+         /* Keep RADV/ACO on the GFX10.3 Vangogh code-generation path while
+          * retaining explicit SGPU/Xclipse flags for Samsung-specific quirks.
+          */
+         if (info->is_xclipse940) {
+            info->family = CHIP_VANGOGH;
+            info->name = "XCLIPSE940";
+         }
+         break;
       case FAMILY_VGH:
          identify_chip(VANGOGH);
          break;
@@ -914,7 +968,9 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
          break;
       }
 
-      if (info->ip[AMD_IP_GFX].ver_major == 12 && info->ip[AMD_IP_GFX].ver_minor == 0)
+      if (info->is_xclipse940)
+         info->gfx_level = GFX10_3;
+      else if (info->ip[AMD_IP_GFX].ver_major == 12 && info->ip[AMD_IP_GFX].ver_minor == 0)
          info->gfx_level = GFX12;
       else if (info->ip[AMD_IP_GFX].ver_major == 11 && info->ip[AMD_IP_GFX].ver_minor == 5)
          info->gfx_level = GFX11_5;
@@ -1043,7 +1099,13 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    }
 
    /* Set which chips have dedicated VRAM. */
-   info->has_dedicated_vram = !(device_info.ids_flags & AMDGPU_IDS_FLAGS_FUSION);
+   /* Set which chips have dedicated VRAM. */
+   info->has_dedicated_vram =
+      !(device_info.ids_flags & AMDGPU_IDS_FLAGS_FUSION);
+
+   /* Samsung Xclipse 940 is an UMA/platform GPU. */
+   if (info->is_xclipse940)
+      info->has_dedicated_vram = false;
 
    /* The kernel can split large buffers in VRAM but not in GTT, so large
     * allocations can fail or cause buffer movement failures in the kernel.

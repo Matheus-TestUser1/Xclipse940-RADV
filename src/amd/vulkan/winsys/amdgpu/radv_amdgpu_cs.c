@@ -230,7 +230,14 @@ radv_amdgpu_cs_domain(const struct radeon_winsys *_ws)
    bool use_sam =
       (enough_vram && enough_bandwidth && ws->info.has_dedicated_vram && !(ws->perftest & RADV_PERFTEST_NO_SAM)) ||
       (ws->perftest & RADV_PERFTEST_SAM);
-   return RADEON_DOMAIN_GTT; /* sgpu: always use GTT */
+
+   /* SGPU is an integrated/unified-memory design. Keep IBs in GTT on
+    * Samsung, but don't force that policy onto regular AMD GPUs.
+    */
+   if (ws->info.is_sgpu)
+      return RADEON_DOMAIN_GTT;
+
+   return use_sam ? RADEON_DOMAIN_VRAM : RADEON_DOMAIN_GTT;
 }
 
 static VkResult
@@ -262,7 +269,6 @@ radv_amdgpu_cs_get_new_ib(struct radeon_cmdbuf *_cs, uint32_t ib_size)
       return result;
 
    cs->ib_mapped = radv_buffer_map(&cs->ws->base, cs->ib_buffer);
-   fprintf(stderr, "sgpu: ib_mapped=%p bo_va=0x%lx\n", cs->ib_mapped, radv_amdgpu_winsys_bo(cs->ib_buffer)->base.va);
    if (!cs->ib_mapped) {
       cs->ws->base.buffer_destroy(&cs->ws->base, cs->ib_buffer);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -316,7 +322,6 @@ radv_amdgpu_cs_create(struct radeon_winsys *ws, enum amd_ip_type ip_type, bool i
       free(cs);
       return NULL;
    }
-   fprintf(stderr, "sgpu: cs created ok ip_type=%d\n", ip_type);
 
    return &cs->base;
 }
@@ -1228,27 +1233,82 @@ radv_amdgpu_cs_submit_zero(struct radv_amdgpu_ctx *ctx, enum amd_ip_type ip_type
 {
    unsigned hw_ip = ip_type;
    unsigned queue_syncobj = radv_amdgpu_ctx_queue_syncobj(ctx, hw_ip, queue_idx);
+   const bool use_native_zero_submit =
+      !ctx->ws->info.is_sgpu || ctx->ws->info.is_xclipse940;
    int ret;
 
    if (!queue_syncobj)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-   /* sgpu: amdgpu_cs_syncobj_export_sync_file unsupported, skip wait merge */
-   if (0 && (sem_info->wait.syncobj_count || sem_info->wait.timeline_syncobj_count)) {
-      int fd = -1;
-      (void)fd;
+   /*
+    * Xclipse 940 / S5E9945:
+    *
+    * Runtime probes on renderD128 confirmed:
+    *  - syncobj <-> sync_file export/import works;
+    *  - timeline point export through export_sync_file2 works;
+    *  - binary -> timeline-point syncobj transfer works.
+    *
+    * Therefore use RADV's native zero-submit synchronization path for
+    * Xclipse 940. Keep the old SGPU fallback only for older experimental
+    * SGPU targets whose syncobj/sync_file support has not been verified.
+    */
+   if (!use_native_zero_submit) {
+      for (unsigned i = 0; i < sem_info->signal.syncobj_count; ++i) {
+         uint32_t dst_handle = sem_info->signal.syncobj[i];
+         ret = drmSyncobjSignal(ctx->ws->fd, &dst_handle, 1);
+         if (ret < 0)
+            return VK_ERROR_DEVICE_LOST;
+      }
+
+      for (unsigned i = 0; i < sem_info->signal.timeline_syncobj_count; ++i) {
+         ret = amdgpu_cs_syncobj_transfer(ctx->ws->dev,
+                                          sem_info->signal.syncobj[i + sem_info->signal.syncobj_count],
+                                          sem_info->signal.points[i],
+                                          queue_syncobj, 0, 0);
+         if (ret < 0)
+            return VK_ERROR_DEVICE_LOST;
+      }
+
+      return VK_SUCCESS;
+   }
+
+   if (sem_info->wait.syncobj_count || sem_info->wait.timeline_syncobj_count) {
+      int fd;
+
+      ret = amdgpu_cs_syncobj_export_sync_file(ctx->ws->dev, queue_syncobj, &fd);
+      if (ret < 0)
+         return VK_ERROR_DEVICE_LOST;
+
+      for (unsigned i = 0; i < sem_info->wait.syncobj_count; ++i) {
+         int fd2;
+
+         ret = amdgpu_cs_syncobj_export_sync_file(ctx->ws->dev, sem_info->wait.syncobj[i], &fd2);
+         if (ret < 0) {
+            close(fd);
+            return VK_ERROR_DEVICE_LOST;
+         }
+
+         sync_accumulate("radv", &fd, fd2);
+         close(fd2);
+      }
+
       for (unsigned i = 0; i < sem_info->wait.timeline_syncobj_count; ++i) {
          int fd2;
+
          ret = amdgpu_cs_syncobj_export_sync_file2(
-            ctx->ws->dev, sem_info->wait.syncobj[i + sem_info->wait.syncobj_count], sem_info->wait.points[i], 0, &fd2);
+            ctx->ws->dev,
+            sem_info->wait.syncobj[i + sem_info->wait.syncobj_count],
+            sem_info->wait.points[i], 0, &fd2);
          if (ret < 0) {
-            /* This works around a kernel bug where the fence isn't copied if it is already
-             * signalled. Since it is already signalled it is totally fine to not wait on it.
-             *
-             * kernel patch: https://patchwork.freedesktop.org/patch/465583/ */
+            /*
+             * Work around kernels where exporting an already-signaled
+             * timeline point can fail because no fence object is copied.
+             */
             uint64_t point;
-            ret = amdgpu_cs_syncobj_query2(ctx->ws->dev, &sem_info->wait.syncobj[i + sem_info->wait.syncobj_count],
-                                           &point, 1, 0);
+            ret = amdgpu_cs_syncobj_query2(
+               ctx->ws->dev,
+               &sem_info->wait.syncobj[i + sem_info->wait.syncobj_count],
+               &point, 1, 0);
             if (!ret && point >= sem_info->wait.points[i])
                continue;
 
@@ -1259,31 +1319,49 @@ radv_amdgpu_cs_submit_zero(struct radv_amdgpu_ctx *ctx, enum amd_ip_type ip_type
          sync_accumulate("radv", &fd, fd2);
          close(fd2);
       }
+
       ret = amdgpu_cs_syncobj_import_sync_file(ctx->ws->dev, queue_syncobj, fd);
       close(fd);
       if (ret < 0)
          return VK_ERROR_DEVICE_LOST;
 
-      /* sgpu: never set queue_syncobj_wait, we signal manually */
-      /* ctx->queue_syncobj_wait[hw_ip][queue_idx] = true; */
+      ctx->queue_syncobj_wait[hw_ip][queue_idx] = true;
    }
 
    for (unsigned i = 0; i < sem_info->signal.syncobj_count; ++i) {
       uint32_t dst_handle = sem_info->signal.syncobj[i];
       uint32_t src_handle = queue_syncobj;
 
-      /* sgpu: skip amdgpu transfer/export, signal directly */
-      drmSyncobjSignal(ctx->ws->fd, &dst_handle, 1);
+      if (ctx->ws->info.has_timeline_syncobj) {
+         ret = amdgpu_cs_syncobj_transfer(ctx->ws->dev, dst_handle, 0, src_handle, 0, 0);
+         if (ret < 0)
+            return VK_ERROR_DEVICE_LOST;
+      } else {
+         int fd;
+
+         ret = amdgpu_cs_syncobj_export_sync_file(ctx->ws->dev, src_handle, &fd);
+         if (ret < 0)
+            return VK_ERROR_DEVICE_LOST;
+
+         ret = amdgpu_cs_syncobj_import_sync_file(ctx->ws->dev, dst_handle, fd);
+         close(fd);
+         if (ret < 0)
+            return VK_ERROR_DEVICE_LOST;
+      }
    }
+
    for (unsigned i = 0; i < sem_info->signal.timeline_syncobj_count; ++i) {
-      ret = amdgpu_cs_syncobj_transfer(ctx->ws->dev, sem_info->signal.syncobj[i + sem_info->signal.syncobj_count],
-                                       sem_info->signal.points[i], queue_syncobj, 0, 0);
+      ret = amdgpu_cs_syncobj_transfer(
+         ctx->ws->dev,
+         sem_info->signal.syncobj[i + sem_info->signal.syncobj_count],
+         sem_info->signal.points[i],
+         queue_syncobj, 0, 0);
       if (ret < 0)
          return VK_ERROR_DEVICE_LOST;
    }
+
    return VK_SUCCESS;
 }
-
 static VkResult
 radv_amdgpu_winsys_cs_submit(struct radeon_winsys_ctx *_ctx, const struct radv_winsys_submit_info *submit,
                              uint32_t wait_count, const struct vk_sync_wait *waits, uint32_t signal_count,
@@ -1763,6 +1841,13 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
    uint32_t queue_syncobj = radv_amdgpu_ctx_queue_syncobj(ctx, request->ip_type, request->ring);
    bool *queue_syncobj_wait = &ctx->queue_syncobj_wait[request->ip_type][request->ring];
 
+   /* Xclipse 940's S5E9945 kernel implements the normal AMDGPU syncobj and
+    * BO_HANDLES submission ABI. Older experimental SGPU ports bypassed these
+    * paths; doing that on 940 adds CPU stalls and can violate Vulkan ordering.
+    */
+   const bool use_native_submit =
+      !ctx->ws->info.is_sgpu || ctx->ws->info.is_xclipse940;
+
    if (!queue_syncobj)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
@@ -1802,7 +1887,7 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
 
    assert(chunk_data[request->number_of_ibs - 1].ib_data.ip_type == request->ip_type);
 
-   if (0 && has_user_fence) {
+   if (use_native_submit && has_user_fence) {
       i = num_chunks++;
       chunks[i].chunk_id = AMDGPU_CHUNK_ID_FENCE;
       chunks[i].length_dw = sizeof(struct drm_amdgpu_cs_chunk_fence) / 4;
@@ -1820,8 +1905,10 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
       amdgpu_cs_chunk_fence_info_to_data(&fence_info, &chunk_data[i]);
    }
 
-   if (0 && sem_info->cs_emit_wait &&
-       (sem_info->wait.timeline_syncobj_count || sem_info->wait.syncobj_count /* sgpu: || *queue_syncobj_wait */)) {
+   if (use_native_submit && sem_info->cs_emit_wait &&
+       (sem_info->wait.timeline_syncobj_count ||
+        sem_info->wait.syncobj_count ||
+        *queue_syncobj_wait)) {
 
       if (ctx->ws->info.has_timeline_syncobj) {
          wait_syncobj = radv_amdgpu_cs_alloc_timeline_syncobj_chunk(&sem_info->wait, queue_syncobj, &chunks[num_chunks],
@@ -1861,8 +1948,16 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
    bo_list_in.bo_info_size = sizeof(struct drm_amdgpu_bo_list_entry);
    bo_list_in.bo_info_ptr = (uint64_t)(uintptr_t)request->handles;
 
-   /* sgpu: skip BO_HANDLES chunk */
-   //(disabled) chunks[num_chunks].chunk_id = AMDGPU_CHUNK_ID_BO_HANDLES;
+   /* The S5E9945 SGPU parser implements AMDGPU_CHUNK_ID_BO_HANDLES.
+    * Restore normal BO validation on Xclipse 940 instead of relying on the
+    * experimental port's skip.
+    */
+   if (use_native_submit) {
+      chunks[num_chunks].chunk_id = AMDGPU_CHUNK_ID_BO_HANDLES;
+      chunks[num_chunks].length_dw = sizeof(struct drm_amdgpu_bo_list_in) / 4;
+      chunks[num_chunks].chunk_data = (uint64_t)(uintptr_t)&bo_list_in;
+      num_chunks++;
+   }
 
    /* The kernel returns -ENOMEM with many parallel processes using GDS such as test suites quite
     * often, but it eventually succeeds after enough attempts. This happens frequently with dEQP
@@ -1876,22 +1971,30 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
       if (r == -ENOMEM)
          os_time_sleep(1000);
 
-      fprintf(stderr, "sgpu: submit ip=%u ring=%u num_chunks=%d\n", request->ip_type, request->ring, num_chunks);
-   for(int _i=0;_i<num_chunks;_i++) fprintf(stderr, "  chunk[%d] id=%u\n", _i, chunks[_i].chunk_id);
-   r = amdgpu_cs_submit_raw2(ctx->ws->dev, ctx->ctx, 0, num_chunks, chunks, &request->seq_no);
+      r = amdgpu_cs_submit_raw2(ctx->ws->dev, ctx->ctx, 0, num_chunks, chunks, &request->seq_no);
    } while (r == -ENOMEM && os_time_get_nano() < abs_timeout_ns);
-   if (!r) {
-      struct amdgpu_cs_fence fence = {.context=ctx->ctx, .ip_type=request->ip_type, .ring=request->ring, .fence=request->seq_no};
+
+   /* Legacy SGPU fallback only. Never force a fence to "expired": doing so
+    * tells userspace work completed before the GPU actually completed it.
+    * Xclipse 940 uses the kernel's real syncobj signaling above.
+    */
+   if (!r && ctx->ws->info.is_sgpu && !ctx->ws->info.is_xclipse940) {
+      struct amdgpu_cs_fence fence = {
+         .context = ctx->ctx,
+         .ip_type = request->ip_type,
+         .ring = request->ring,
+         .fence = request->seq_no,
+      };
       uint32_t expired = 0;
       int pr = amdgpu_cs_query_fence_status(&fence, 2000000000ull, 0, &expired);
-      expired = 1; // FORȚEAZĂ SEMNALIZAREA HARDWARE INSTANTANEE
-      fprintf(stderr, "sgpu: fence poll ret=%d expired=%u seq=%llu\n", pr, expired, (unsigned long long)request->seq_no);
-      /* sgpu does not signal syncobjs after execution, do it manually (eagerly signal for async pipelines) */
-      if (!pr) {
+
+      if (!pr && expired) {
          uint32_t qsync = radv_amdgpu_ctx_queue_syncobj(ctx, request->ip_type, request->ring);
-         if (qsync) drmSyncobjSignal(ctx->ws->fd, &qsync, 1);
-         for (unsigned _si = 0; _si < sem_info->signal.syncobj_count; _si++)
-            drmSyncobjSignal(ctx->ws->fd, &sem_info->signal.syncobj[_si], 1);
+         if (qsync)
+            drmSyncobjSignal(ctx->ws->fd, &qsync, 1);
+
+         for (unsigned i = 0; i < sem_info->signal.syncobj_count; i++)
+            drmSyncobjSignal(ctx->ws->fd, &sem_info->signal.syncobj[i], 1);
       }
    }
 

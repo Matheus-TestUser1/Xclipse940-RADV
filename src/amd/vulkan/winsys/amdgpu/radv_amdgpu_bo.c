@@ -415,6 +415,14 @@ radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned 
    request.alloc_size = size;
    request.phys_alignment = alignment;
 
+   /* Samsung SGPU 6.1.157 rejects GEM_CREATE requests that don't include
+    * AMDGPU_GEM_DOMAIN_GTT. GTT is also valid on older S5E9945 SGPU stacks,
+    * so make it a baseline SGPU allocation domain instead of keying this
+    * userspace driver to a kernel version.
+    */
+   if (ws->info.is_sgpu)
+      request.preferred_heap |= AMDGPU_GEM_DOMAIN_GTT;
+
    if (initial_domain & RADEON_DOMAIN_VRAM) {
       request.preferred_heap |= AMDGPU_GEM_DOMAIN_VRAM;
 
@@ -467,7 +475,6 @@ radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned 
    if (flags & RADEON_FLAG_DISCARDABLE && ws->info.drm_minor >= 47)
       request.flags |= AMDGPU_GEM_CREATE_DISCARDABLE;
 
-   fprintf(stderr, "sgpu: bo_alloc heap=%u flags=0x%lx size=%"PRIu64" align=%"PRIu64"\n", request.preferred_heap, request.flags, request.alloc_size, request.phys_alignment);
    r = amdgpu_bo_alloc(ws->dev, &request, &buf_handle);
    if (r) {
       fprintf(stderr, "radv/amdgpu: Failed to allocate a buffer:\n");
@@ -546,7 +553,6 @@ radv_amdgpu_winsys_bo_map(struct radeon_winsys *_ws, struct radeon_winsys_bo *_b
 
    void *data = NULL;
    int ret = amdgpu_bo_cpu_map(bo->bo, &data);
-   fprintf(stderr, "sgpu: amdgpu_bo_cpu_map ret=%d data=%p\n", ret, data);
    if (ret == 0 && data) {
       uintptr_t page_start = (uintptr_t)data & ~((uintptr_t)4095);
       if (mprotect((void *)page_start, bo->base.size, PROT_READ | PROT_WRITE) != 0) {

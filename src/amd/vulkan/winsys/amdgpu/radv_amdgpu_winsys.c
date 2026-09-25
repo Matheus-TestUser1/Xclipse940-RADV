@@ -41,14 +41,34 @@ do_winsys_init(struct radv_amdgpu_winsys *ws, int fd)
    if (!ac_query_gpu_info(fd, ws->dev, &ws->info, true))
       return false;
 
-   /* sgpu reports wrong gfx_level, force GFX10_3 for Xclipse 920 */
-   if (ws->info.gfx_level != GFX10_3) {
-      fprintf(stderr, "sgpu: overriding gfx_level %d -> GFX10_3\n", ws->info.gfx_level);
-      ws->info.gfx_level = GFX10_3;
-      ws->info.family = CHIP_VANGOGH;
+   /* Keep SGPU-specific limitations scoped to SGPU. The old port forced
+    * every device to GFX10.3 and disabled timeline syncobjs globally.
+    *
+    * S5E9945's SGPU kernel implements SYNCOBJ_IN/OUT and timeline
+    * WAIT/SIGNAL chunks, so Xclipse 940 can use RADV's native sync path.
+    */
+   if (ws->info.is_sgpu) {
+      /* S5E9945's SGPU UAPI exposes AMDGPU_GEM_USERPTR and the 940's
+       * proprietary Vulkan driver exposes external-memory-host support.
+       * Trust the capability detected by libdrm on MGFX2 instead of
+       * unconditionally disabling it as the old Xclipse 920 port did.
+       */
+      if (!ws->info.is_xclipse940)
+         ws->info.has_userptr = false;
+
+      /* Preserve the legacy Xclipse 920 fallback until that generation gets
+       * explicit revision-aware handling. Never apply it to MGFX2/940.
+       */
+      if (!ws->info.is_xclipse940) {
+         if (ws->info.gfx_level != GFX10_3) {
+            fprintf(stderr, "sgpu: legacy fallback gfx_level %d -> GFX10_3\n",
+                    ws->info.gfx_level);
+            ws->info.gfx_level = GFX10_3;
+            ws->info.family = CHIP_VANGOGH;
+         }
+         ws->info.has_timeline_syncobj = false;
+      }
    }
-   ws->info.has_timeline_syncobj = false;
-   ws->info.has_userptr = false;
 
    if (!radv_is_gpu_supported(&ws->info))
       return false;

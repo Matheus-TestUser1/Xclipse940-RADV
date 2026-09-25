@@ -1,0 +1,163 @@
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
+@@ -1233,30 +1233,57 @@
+ {
+    unsigned hw_ip = ip_type;
+    unsigned queue_syncobj = radv_amdgpu_ctx_queue_syncobj(ctx, hw_ip, queue_idx);
++   const bool use_native_zero_submit =
++      !ctx->ws->info.is_sgpu || ctx->ws->info.is_xclipse940;
+    int ret;
+ 
+    if (!queue_syncobj)
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+ 
+-   /* sgpu: amdgpu_cs_syncobj_export_sync_file unsupported, skip wait merge */
+-   if (0 && (sem_info->wait.syncobj_count || sem_info->wait.timeline_syncobj_count)) {
+-      int fd = -1;
+-      (void)fd;
+-      for (unsigned i = 0; i < sem_info->wait.timeline_syncobj_count; ++i) {
++   /*
++    * Xclipse 940 / S5E9945:
++    *
++    * Runtime probes on renderD128 confirmed:
++    *  - syncobj <-> sync_file export/import works;
++    *  - timeline point export through export_sync_file2 works;
++    *  - binary -> timeline-point syncobj transfer works.
++    *
++    * Therefore use RADV's native zero-submit synchronization path for
++    * Xclipse 940. Keep the old SGPU fallback only for older experimental
++    * SGPU targets whose syncobj/sync_file support has not been verified.
++    */
++   if (!use_native_zero_submit) {
++      for (unsigned i = 0; i < sem_info->signal.syncobj_count; ++i) {
++         uint32_t dst_handle = sem_info->signal.syncobj[i];
++         ret = drmSyncobjSignal(ctx->ws->fd, &dst_handle, 1);
++         if (ret < 0)
++            return VK_ERROR_DEVICE_LOST;
++      }
++
++      for (unsigned i = 0; i < sem_info->signal.timeline_syncobj_count; ++i) {
++         ret = amdgpu_cs_syncobj_transfer(ctx->ws->dev,
++                                          sem_info->signal.syncobj[i + sem_info->signal.syncobj_count],
++                                          sem_info->signal.points[i],
++                                          queue_syncobj, 0, 0);
++         if (ret < 0)
++            return VK_ERROR_DEVICE_LOST;
++      }
++
++      return VK_SUCCESS;
++   }
++
++   if (sem_info->wait.syncobj_count || sem_info->wait.timeline_syncobj_count) {
++      int fd;
++
++      ret = amdgpu_cs_syncobj_export_sync_file(ctx->ws->dev, queue_syncobj, &fd);
++      if (ret < 0)
++         return VK_ERROR_DEVICE_LOST;
++
++      for (unsigned i = 0; i < sem_info->wait.syncobj_count; ++i) {
+          int fd2;
+-         ret = amdgpu_cs_syncobj_export_sync_file2(
+-            ctx->ws->dev, sem_info->wait.syncobj[i + sem_info->wait.syncobj_count], sem_info->wait.points[i], 0, &fd2);
++
++         ret = amdgpu_cs_syncobj_export_sync_file(ctx->ws->dev, sem_info->wait.syncobj[i], &fd2);
+          if (ret < 0) {
+-            /* This works around a kernel bug where the fence isn't copied if it is already
+-             * signalled. Since it is already signalled it is totally fine to not wait on it.
+-             *
+-             * kernel patch: https://patchwork.freedesktop.org/patch/465583/ */
+-            uint64_t point;
+-            ret = amdgpu_cs_syncobj_query2(ctx->ws->dev, &sem_info->wait.syncobj[i + sem_info->wait.syncobj_count],
+-                                           &point, 1, 0);
+-            if (!ret && point >= sem_info->wait.points[i])
+-               continue;
+-
+             close(fd);
+             return VK_ERROR_DEVICE_LOST;
+          }
+@@ -1264,31 +1291,77 @@
+          sync_accumulate("radv", &fd, fd2);
+          close(fd2);
+       }
++
++      for (unsigned i = 0; i < sem_info->wait.timeline_syncobj_count; ++i) {
++         int fd2;
++
++         ret = amdgpu_cs_syncobj_export_sync_file2(
++            ctx->ws->dev,
++            sem_info->wait.syncobj[i + sem_info->wait.syncobj_count],
++            sem_info->wait.points[i], 0, &fd2);
++         if (ret < 0) {
++            /*
++             * Work around kernels where exporting an already-signaled
++             * timeline point can fail because no fence object is copied.
++             */
++            uint64_t point;
++            ret = amdgpu_cs_syncobj_query2(
++               ctx->ws->dev,
++               &sem_info->wait.syncobj[i + sem_info->wait.syncobj_count],
++               &point, 1, 0);
++            if (!ret && point >= sem_info->wait.points[i])
++               continue;
++
++            close(fd);
++            return VK_ERROR_DEVICE_LOST;
++         }
++
++         sync_accumulate("radv", &fd, fd2);
++         close(fd2);
++      }
++
+       ret = amdgpu_cs_syncobj_import_sync_file(ctx->ws->dev, queue_syncobj, fd);
+       close(fd);
+       if (ret < 0)
+          return VK_ERROR_DEVICE_LOST;
+ 
+-      /* sgpu: never set queue_syncobj_wait, we signal manually */
+-      /* ctx->queue_syncobj_wait[hw_ip][queue_idx] = true; */
++      ctx->queue_syncobj_wait[hw_ip][queue_idx] = true;
+    }
+ 
+    for (unsigned i = 0; i < sem_info->signal.syncobj_count; ++i) {
+       uint32_t dst_handle = sem_info->signal.syncobj[i];
+       uint32_t src_handle = queue_syncobj;
+ 
+-      /* sgpu: skip amdgpu transfer/export, signal directly */
+-      drmSyncobjSignal(ctx->ws->fd, &dst_handle, 1);
+-   }
++      if (ctx->ws->info.has_timeline_syncobj) {
++         ret = amdgpu_cs_syncobj_transfer(ctx->ws->dev, dst_handle, 0, src_handle, 0, 0);
++         if (ret < 0)
++            return VK_ERROR_DEVICE_LOST;
++      } else {
++         int fd;
++
++         ret = amdgpu_cs_syncobj_export_sync_file(ctx->ws->dev, src_handle, &fd);
++         if (ret < 0)
++            return VK_ERROR_DEVICE_LOST;
++
++         ret = amdgpu_cs_syncobj_import_sync_file(ctx->ws->dev, dst_handle, fd);
++         close(fd);
++         if (ret < 0)
++            return VK_ERROR_DEVICE_LOST;
++      }
++   }
++
+    for (unsigned i = 0; i < sem_info->signal.timeline_syncobj_count; ++i) {
+-      ret = amdgpu_cs_syncobj_transfer(ctx->ws->dev, sem_info->signal.syncobj[i + sem_info->signal.syncobj_count],
+-                                       sem_info->signal.points[i], queue_syncobj, 0, 0);
++      ret = amdgpu_cs_syncobj_transfer(
++         ctx->ws->dev,
++         sem_info->signal.syncobj[i + sem_info->signal.syncobj_count],
++         sem_info->signal.points[i],
++         queue_syncobj, 0, 0);
+       if (ret < 0)
+          return VK_ERROR_DEVICE_LOST;
+    }
++
+    return VK_SUCCESS;
+ }
+-
+ static VkResult
+ radv_amdgpu_winsys_cs_submit(struct radeon_winsys_ctx *_ctx, const struct radv_winsys_submit_info *submit,
+                              uint32_t wait_count, const struct vk_sync_wait *waits, uint32_t signal_count,

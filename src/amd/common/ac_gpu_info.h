@@ -80,6 +80,16 @@ struct radeon_info {
 
    /* Flags. */
    bool family_overridden; /* AMD_FORCE_FAMILY was used, skip command submission */
+
+   /* Samsung SGPU / Xclipse identification.
+    *
+    * Samsung's S5E9945 kernel reports FAMILY_MGFX (147). For MGFX2 the
+    * external revision is the raw GRBM_CHIP_REVISION, which lets userspace
+    * distinguish Xclipse 940 without pretending that every SGPU is Van Gogh.
+    */
+   bool is_sgpu;
+   bool is_xclipse940;
+
    bool is_pro_graphics;
    bool has_graphics; /* false if the chip is compute-only */
    bool has_clear_state;

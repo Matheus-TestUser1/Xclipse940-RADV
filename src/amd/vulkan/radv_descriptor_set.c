@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "ac_descriptors.h"
 #include "radv_buffer.h"
@@ -709,6 +710,18 @@ radv_descriptor_set_create(struct radv_device *device, struct radv_descriptor_po
       pool->entries[index].set = set;
    } else
       return VK_ERROR_OUT_OF_POOL_MEMORY;
+const struct radv_physical_device *pdev = radv_device_physical(device);
+
+if (pdev->info.is_xclipse940) {
+   fprintf(stderr,
+           "x940-descset: set_va=0x%016llx set_hi=0x%08x "
+           "address32_hi=0x%08x mapped=%p size=%u\n",
+           (unsigned long long)set->header.va,
+           (unsigned)(set->header.va >> 32),
+           pdev->info.address32_hi,
+           (void *)set->header.mapped_ptr,
+           set->header.size);
+}
 
    if (layout->has_immutable_samplers) {
       for (unsigned i = 0; i < layout->binding_count; ++i) {
@@ -1080,6 +1093,17 @@ write_buffer_descriptor(struct radv_device *device, unsigned *dst, uint64_t va, 
     * more efficient 8/16-bit buffer accesses.
     */
    ac_build_raw_buffer_descriptor(pdev->info.gfx_level, va, align(range, 4), dst);
+   if (pdev->info.is_xclipse940) {
+   fprintf(stderr,
+           "x940-desc: target_va=0x%016llx target_hi=0x%08x "
+           "address32_hi=0x%08x range=%llu "
+           "dw=%08x %08x %08x %08x\n",
+           (unsigned long long)va,
+           (unsigned)(va >> 32),
+           pdev->info.address32_hi,
+           (unsigned long long)range,
+           dst[0], dst[1], dst[2], dst[3]);
+}
 }
 
 static ALWAYS_INLINE void

@@ -154,7 +154,7 @@ sync_has_sync_file(struct vk_device *device, struct vk_sync *sync)
     * eventually.  Do a zero-time syncobj wait if the export failed.
     */
    err = drmSyncobjWait(device->drm_fd, &handle, 1, 0 /* timeout */,
-                        0, /* sgpu: no WAIT_FOR_SUBMIT */
+                        DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
                         NULL /* first_signaled */);
    if (!err) {
       return VK_SUCCESS;
@@ -247,7 +247,7 @@ vk_drm_syncobj_wait_many(struct vk_device *device,
    assert(j <= wait_count);
    wait_count = j;
 
-   uint32_t syncobj_wait_flags = 0; /* sgpu: no WAIT_FOR_SUBMIT, syncobjs manually signaled */
+   uint32_t syncobj_wait_flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
    if (!(wait_flags & VK_SYNC_WAIT_ANY))
       syncobj_wait_flags |= DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL;
 

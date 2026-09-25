@@ -609,9 +609,25 @@ struct ac_addrlib *ac_addrlib_create(const struct radeon_info *info,
    regValue.gbAddrConfig = info->gb_addr_config;
    createFlags.value = 0;
 
+  if (info->is_xclipse940) {
+   /*
+    * Samsung MGFX2/Xclipse 940 uses the GFX10.3/Vangogh-compatible
+    * AddrLib path, but upstream AddrLib doesn't know FAMILY_MGFX (147)
+    * or Samsung's encoded GRBM revision (0x02600200).
+    *
+    * Keep the real identifiers in radeon_info and translate only at
+    * the AddrLib boundary.
+    */
+   addrCreateInput.chipFamily = FAMILY_VGH;
+   addrCreateInput.chipRevision = 0x01;
+} else {
    addrCreateInput.chipFamily = info->family_id;
    addrCreateInput.chipRevision = info->chip_external_rev;
-
+}
+   fprintf(stderr,
+        "x940: AddrLib translated family=%u revision=0x%x\n",
+        addrCreateInput.chipFamily,
+        addrCreateInput.chipRevision);
    if (addrCreateInput.chipFamily == FAMILY_UNKNOWN)
       return NULL;
 
