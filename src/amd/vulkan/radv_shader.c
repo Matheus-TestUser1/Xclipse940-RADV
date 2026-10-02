@@ -9,6 +9,8 @@
  */
 
 #include "radv_shader.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include "meta/radv_meta.h"
 #include "nir/nir.h"
 #include "nir/nir_builder.h"
@@ -778,8 +780,36 @@ radv_lower_ngg(struct radv_device *device, struct radv_shader_stage *ngg_stage,
       options.num_vertices_per_primitive = num_vertices_per_prim;
       options.early_prim_export = info->has_ngg_early_prim_export;
       options.passthrough = info->is_ngg_passthrough;
+
+      /* Diagnostic Xclipse 940 / MGFX2:
+       * stock SCPC NGG passthrough does not emit GS_ALLOC_REQ.
+       */
+      options.passthrough_no_msg =
+         pdev->info.is_xclipse940 && getenv("RADV_X940_NGG_NO_MSG_V6");
+
+      if (options.passthrough_no_msg) {
+         fprintf(stderr,
+                 "x940-ngg-no-msg-v6: passthrough=%u family=%u no_msg=%u\n",
+                 (unsigned)options.passthrough,
+                 (unsigned)options.family,
+                 (unsigned)options.passthrough_no_msg);
+      }
+
       options.export_primitive_id = info->outinfo.export_prim_id;
       options.instance_rate_inputs = gfx_state->vi.instance_rate_inputs << VERT_ATTRIB_GENERIC0;
+
+      /*
+       * Xclipse 940 / MGFX2 diagnostic:
+       * use the pre-GFX12 NGG primitive/index packing during NIR lowering.
+       * Keep the physical device gfx_level unchanged everywhere else.
+       */
+      if (radv_device_physical(device)->info.is_xclipse940 &&
+          getenv("RADV_X940_NIR_NGG_GFX11")) {
+         fprintf(stderr,
+                 "x940-nir-ngg: gfx_level %u -> GFX11 for NGG NIR lowering\n",
+                 (unsigned)options.gfx_level);
+         options.gfx_level = GFX11;
+      }
 
       NIR_PASS_V(nir, ac_nir_lower_ngg_nogs, &options);
 
@@ -1013,6 +1043,9 @@ radv_alloc_shader_memory(struct radv_device *device, uint32_t size, bool replaya
 
    size = ac_align_shader_binary_for_prefetch(&pdev->info, size);
    size = align(size, RADV_SHADER_ALLOC_ALIGNMENT);
+   if (pdev->info.is_xclipse940 && getenv("RADV_X940_DIAG_SHADER_PAGE_STRIDE"))
+      size = align(size, 4096);
+
 
    mtx_lock(&device->shader_arena_mutex);
 
@@ -1341,6 +1374,27 @@ radv_should_use_wgp_mode(const struct radv_device *device, gl_shader_stage stage
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
    enum amd_gfx_level chip = pdev->info.gfx_level;
+
+   /*
+    * Xclipse 940 / MGFX2:
+    *
+    * Samsung's NGG primitive shader uses WGP_MODE=1.  Do this here,
+    * before ACO compilation, rather than changing only the emitted
+    * RSRC1 bit after the shader has already been compiled.
+    */
+   if (pdev->info.is_xclipse940 &&
+       info->is_ngg &&
+       getenv("RADV_X940_WGP_MODE_V9") &&
+       (stage == MESA_SHADER_VERTEX ||
+        stage == MESA_SHADER_TESS_EVAL ||
+        stage == MESA_SHADER_GEOMETRY ||
+        stage == MESA_SHADER_MESH)) {
+      fprintf(stderr,
+              "x940-wgp-v9: stage=%u NGG=1 -> compiler WGP_MODE=1\n",
+              (unsigned)stage);
+      return true;
+   }
+
    switch (stage) {
    case MESA_SHADER_COMPUTE:
    case MESA_SHADER_TESS_CTRL:
@@ -1527,7 +1581,7 @@ radv_precompute_registers_hw_ngg(struct radv_device *device, const struct ac_sha
    const bool no_pc_export = info->outinfo.param_exports == 0 && info->outinfo.prim_param_exports == 0;
    const unsigned num_prim_params = info->outinfo.prim_param_exports;
 
-   if (pdev->info.gfx_level >= GFX12) {
+   if (pdev->info.gfx_level >= GFX12 && !pdev->info.is_xclipse940) {
       unsigned num_params = info->outinfo.param_exports;
 
       /* Since there is no alloc/dealloc mechanism for the 12-bit ordered IDs, they can wrap
@@ -1560,7 +1614,17 @@ radv_precompute_registers_hw_ngg(struct radv_device *device, const struct ac_sha
       info->regs.spi_shader_pgm_rsrc3_gs =
          ac_apply_cu_en(S_00B21C_CU_EN(cu_mask) | S_00B21C_WAVE_LIMIT(0x3F), C_00B21C_CU_EN, 0, &pdev->info);
 
-      if (pdev->info.gfx_level >= GFX11) {
+      /*
+       * Xclipse 940 / Samsung GC 10.4 M2 uses the GFX11-style
+       * RSRC4_GS layout for the fields RADV needs here:
+       *
+       *   CU_EN                    bit 0
+       *   SPI_SHADER_LATE_ALLOC_GS bits 16..22
+       *
+       * The physical register address is handled separately by the
+       * X940 MGFX2 register map (0x00b22c).
+       */
+      if (pdev->info.is_xclipse940 || pdev->info.gfx_level >= GFX11) {
          info->regs.spi_shader_pgm_rsrc4_gs =
             ac_apply_cu_en(S_00B204_CU_EN_GFX11(0x1) | S_00B204_SPI_SHADER_LATE_ALLOC_GS_GFX10(late_alloc_wave64),
                            C_00B204_CU_EN_GFX11, 16, &pdev->info);
@@ -1630,7 +1694,7 @@ radv_precompute_registers_hw_ngg(struct radv_device *device, const struct ac_sha
       S_028B90_CNT(gs_num_invocations) | S_028B90_ENABLE(gs_num_invocations > 1) |
       S_028B90_EN_MAX_VERT_OUT_PER_GS_INSTANCE(info->ngg_info.max_vert_out_per_gs_instance);
 
-   if (pdev->info.gfx_level >= GFX11) {
+   if (pdev->info.gfx_level >= GFX11 && !pdev->info.is_xclipse940) {
       /* This should be <= 252 for performance on Gfx11. 256 works too but is slower. */
       const uint32_t max_prim_grp_size = pdev->info.gfx_level >= GFX12 ? 256 : 252;
 
@@ -1641,6 +1705,18 @@ radv_precompute_registers_hw_ngg(struct radv_device *device, const struct ac_sha
    } else {
       info->regs.ngg.ge_cntl = S_03096C_PRIM_GRP_SIZE_GFX10(info->ngg_info.max_gsprims) |
                                S_03096C_VERT_GRP_SIZE(info->ngg_info.hw_max_esverts);
+      if (pdev->info.is_xclipse940 && getenv("RADV_X940_DIAG_NGG_GE_GFX11")) {
+         const uint32_t old_ge_cntl = info->regs.ngg.ge_cntl;
+         info->regs.ngg.ge_cntl =
+            S_03096C_PRIMS_PER_SUBGRP(info->ngg_info.max_gsprims) |
+            S_03096C_VERTS_PER_SUBGRP(info->ngg_info.hw_max_esverts) |
+            S_03096C_PRIM_GRP_SIZE_GFX11(252);
+         fprintf(stderr,
+                 "x940-ngg-ge11: old=0x%08x new=0x%08x prims=%u verts=%u\n",
+                 old_ge_cntl, info->regs.ngg.ge_cntl,
+                 info->ngg_info.max_gsprims, info->ngg_info.hw_max_esverts);
+      }
+
 
       info->regs.vgt_gs_onchip_cntl = S_028A44_ES_VERTS_PER_SUBGRP(info->ngg_info.hw_max_esverts) |
                                       S_028A44_GS_PRIMS_PER_SUBGRP(info->ngg_info.max_gsprims) |
@@ -1980,6 +2056,23 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
                        S_00B12C_SO_EN(!!info->so.num_outputs);
    }
 
+   if (pdev->info.is_xclipse940 &&
+       getenv("RADV_X940_DIAG_RSRC_ALLOC_V9")) {
+      const unsigned x940_sgprs_enc =
+         num_sgprs ? (num_sgprs - 1) / 8 : 0;
+
+      fprintf(stderr,
+              "x940-rsrc-alloc-v9: num_sgprs=%u num_vgprs=%u "
+              "wave=%u user_sgprs=%u sgprs_enc=%u "
+              "float_mode=0x%x lds_size=%u\n",
+              num_sgprs, num_vgprs,
+              info->wave_size,
+              args->num_user_sgprs,
+              x940_sgprs_enc,
+              config->float_mode,
+              config->lds_size);
+   }
+
    config->rsrc1 = S_00B848_VGPRS((num_vgprs - 1) / (info->wave_size == 32 ? 8 : 4)) | S_00B848_DX10_CLAMP(dx10_clamp) |
                    S_00B848_FLOAT_MODE(config->float_mode);
 
@@ -2188,6 +2281,60 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
        * disable exactly 1 CU per SA for GS.
        */
       config->rsrc1 |= S_00B228_GS_VGPR_COMP_CNT(gs_vgpr_comp_cnt) | S_00B228_WGP_MODE(wgp_mode);
+
+      /*
+       * Xclipse 940 / MGFX2 NGG passthrough:
+       *
+       * Samsung stock uses:
+       *   MEM_ORDERED      = 0
+       *   WGP_MODE         = 1
+       *   GS_VGPR_COMP_CNT = 1
+       *
+       * WGP_MODE must already have been selected before ACO compilation
+       * by RADV_X940_WGP_MODE_V9.
+       *
+       * Do not touch SGPRS here: generic GFX10 ACO allocation reporting
+       * isn't directly suitable for the MGFX2 SGPRS field.
+       */
+      if (pdev->info.is_xclipse940 &&
+          info->is_ngg_passthrough &&
+          getenv("RADV_X940_MGFX2_RSRC1_V10")) {
+         const uint32_t old_rsrc1 = config->rsrc1;
+
+         /* MGFX2 MEM_ORDERED: bit 25. */
+         config->rsrc1 &= ~(1u << 25);
+
+         /* MGFX2 GS_VGPR_COMP_CNT: bits 30:29. */
+         config->rsrc1 &= ~(3u << 29);
+         config->rsrc1 |=  (1u << 29);
+
+         if (getenv("RADV_X940_MGFX2_SGPRS_V11")) {
+            const uint32_t old_sgprs_rsrc1 = config->rsrc1;
+
+            /*
+             * MGFX2 SPI_SHADER_PGM_RSRC1_GS.SGPRS = bits [9:6].
+             *
+             * Current ACO shader uses addressable s0..s8 = 9 SGPRs.
+             * GFX10 ACO's config->num_sgprs=128 is only the generic
+             * 128-SGPR allocation granule and is not used here.
+             *
+             * (9 - 1) / 8 = 1.
+             */
+            config->rsrc1 &= ~(0xfu << 6);
+            config->rsrc1 |=  (1u << 6);
+
+            fprintf(stderr,
+                    "x940-sgprs-v11: old=0x%08x new=0x%08x "
+                    "addressable=9 encoding=1\n",
+                    old_sgprs_rsrc1, config->rsrc1);
+         }
+
+         fprintf(stderr,
+                 "x940-rsrc1-v10: old=0x%08x new=0x%08x "
+                 "MEM_ORDERED=0 WGP_MODE=%u GS_VGPR_COMP_CNT=1\n",
+                 old_rsrc1, config->rsrc1, wgp_mode);
+      }
+
       config->rsrc2 |= S_00B22C_ES_VGPR_COMP_CNT(es_vgpr_comp_cnt) | S_00B22C_LDS_SIZE(config->lds_size) |
                        S_00B22C_OC_LDS_EN(es_stage == MESA_SHADER_TESS_EVAL);
    } else if (pdev->info.gfx_level >= GFX9 && stage == MESA_SHADER_GEOMETRY) {
@@ -2361,6 +2508,35 @@ radv_shader_binary_upload(struct radv_device *device, const struct radv_shader_b
          const uint8_t *s_cache = (const uint8_t *)(bin->data + bin->stats_size);
          for (size_t i = 0; i < bin->code_size; i++) { d_cache[i] = s_cache[i]; }
       }
+   }
+
+
+      /* Device-scoped diagnostics: inspect the bytes actually uploaded for
+       * the NGG shader, after any relocation or linking of the binary.
+       */
+      if (radv_device_physical(device)->info.is_xclipse940 && shader->info.is_ngg &&
+          getenv("RADV_X940_DIAG_DUMP_NGG_ISA")) {
+         const uint32_t executable_words = MIN2(shader->exec_size, shader->code_size) / sizeof(uint32_t);
+         const uint32_t count = MIN2(executable_words, 256u);
+         const uint32_t *words = (const uint32_t *)dest_ptr;
+         fprintf(stderr, "x940-ngg-isa: stage=%u va=0x%016llx exec_bytes=%u code_bytes=%u words=%u\n",
+                 (unsigned)shader->info.stage, (unsigned long long)shader->va,
+                 shader->exec_size, shader->code_size, count);
+         for (uint32_t i = 0; i < count; ++i)
+            fprintf(stderr, "x940-ngg-isa: word[%u]=0x%08x\n", i, words[i]);
+         if (count < executable_words)
+            fprintf(stderr, "x940-ngg-isa: truncated executable words=%u\n", executable_words);
+      }
+
+   if (radv_device_physical(device)->info.is_xclipse940 &&
+       shader->info.stage == MESA_SHADER_VERTEX && !shader->info.is_ngg &&
+       getenv("RADV_X940_DIAG_DUMP_VS_ISA")) {
+      const uint32_t count = MIN2(shader->exec_size, shader->code_size) / sizeof(uint32_t);
+      const uint32_t *words = (const uint32_t *)dest_ptr;
+      fprintf(stderr, "x940-vs-isa: va=0x%016llx exec_bytes=%u code_bytes=%u words=%u\n",
+              (unsigned long long)shader->va, shader->exec_size, shader->code_size, count);
+      for (uint32_t i = 0; i < count; i++)
+         fprintf(stderr, "x940-vs-isa: word[%u]=0x%08x\n", i, words[i]);
    }
 
    return true;
@@ -2970,6 +3146,145 @@ radv_capture_shader_executable_info(struct radv_device *device, struct radv_shad
    }
 }
 
+static enum amd_gfx_level
+radv_aco_compile_gfx_level(const struct radv_device *device, enum amd_gfx_level gfx_level)
+{
+   /* Keep ACO's instruction encoding and shader stage selection in the same
+    * diagnostic profile. The physical GPU profile/PM4 stays GFX10.3.
+    */
+   return device->cache_key.x940_aco_native_gfx11 ? GFX11 : gfx_level;
+}
+
+/* Diagnostic oracle for the exact empty-VS line probe, not a compiler fix.
+ * Original GS: PipelineVsFs_0x16897F0B61BCE364.elf, .AMDGPU.disasm.
+ * Executable bytes [0,132); GS padding [132,388), reconstructed verbatim.
+ * No code in this GS reads a physical SGPR above s8 or VGPR above v1.
+ * The V22 register allocation is sufficient; its PM4/config remains in use.
+ */
+static bool
+radv_x940_stock_empty_vs_v23(struct radv_device *device, struct radv_shader_binary **binary)
+{
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   if (!pdev->info.is_xclipse940 || !getenv("RADV_X940_DIAG_STOCK_EMPTY_VS_V23"))
+      return true;
+
+   const struct radv_shader_info *info = &(*binary)->info;
+   if (info->stage != MESA_SHADER_VERTEX || !info->is_ngg)
+      return true;
+
+   const char *cache_off = getenv("MESA_SHADER_CACHE_DISABLE");
+   if (!cache_off || strcmp(cache_off, "1") || !info->is_ngg_passthrough ||
+       info->wave_size != 32 || (*binary)->type != RADV_BINARY_TYPE_LEGACY) {
+      fprintf(stderr, "x940-stock-v23: REFUSED: wrong stage/profile/cache mode\n");
+      return false;
+   }
+
+   static const uint32_t expected_v22[15] = {
+      0xbfb50003u, 0x84008803u, 0x937e00c1u, 0xbfa50002u, 0xf8000941u, 0x80808000u,
+      0x95808003u, 0xbf89fff0u, 0xbefe0000u, 0xbfa50004u, 0x7e000280u, 0x7e0202f2u,
+      0xf80008cfu, 0x01000000u, 0xbfb00000u,
+   };
+   static const uint32_t stock_gs[97] = {
+      0xb080400au, 0xb07effffu, 0xbe844780u, 0xbe840008u, 0xbf840003u, 0x9300ff02u,
+      0x00090016u, 0x9301ff03u, 0x00040018u, 0xbf8b0011u, 0xd71f0001u, 0x000100c1u,
+      0xbf870001u, 0xd60b0001u, 0x04054001u, 0xbe81007eu, 0xbf870001u, 0xd4c9007eu,
+      0x00000101u, 0xbfa50002u, 0xf8000941u, 0x00000000u, 0xbf89fff0u, 0xbefe0001u,
+      0x9300ff02u, 0x0009000cu, 0xbe81007eu, 0xd4c9007eu, 0x00000101u, 0xbfa50002u,
+      0xf80008c0u, 0x00000000u, 0xbfb00000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+      0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+      0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+      0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+      0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+      0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+      0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+      0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+      0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+      0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+      0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+      0xbf9f0000u,
+   };
+   struct radv_shader_binary_legacy *old = (struct radv_shader_binary_legacy *)*binary;
+   if (old->exec_size != sizeof(expected_v22) || old->code_size != 80 ||
+       old->stats_size > old->base.total_size ||
+       old->base.total_size < sizeof(*old) + (size_t)old->stats_size + old->code_size ||
+       memcmp(old->data + old->stats_size, expected_v22, sizeof(expected_v22))) {
+      fprintf(stderr, "x940-stock-v23: REFUSED: shader differs from the exact V22 probe\n");
+      return false;
+   }
+
+   const size_t total = sizeof(*old) + sizeof(stock_gs);
+   struct radv_shader_binary_legacy *oracle = calloc(1, total);
+   if (!oracle)
+      return false;
+   oracle->base = old->base;
+   oracle->base.total_size = total;
+   oracle->exec_size = 132;
+   oracle->code_size = sizeof(stock_gs);
+   /* Strip the original ACO statistics/IR/disassembly: they describe V22,
+    * not this explicitly injected stock diagnostic code.
+    */
+   memcpy(oracle->data, stock_gs, sizeof(stock_gs));
+   free(old);
+   *binary = &oracle->base;
+   fprintf(stderr, "x940-stock-v23: exact stock GS loaded exec_bytes=132 code_bytes=388; config unchanged\n");
+   return true;
+}
+
+/* V25 resources are restricted to the exact stock GS injected by V23.
+ * They are not a generic ABI for ACO-generated shaders.
+ */
+static bool
+radv_x940_stock_resources_v25(struct radv_device *device, struct radv_shader_binary *binary)
+{
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   if (!pdev->info.is_xclipse940 || !getenv("RADV_X940_DIAG_STOCK_RESOURCES_V25"))
+      return true;
+   if (binary->info.stage != MESA_SHADER_VERTEX || !binary->info.is_ngg)
+      return true;
+
+   const char *cache_off = getenv("MESA_SHADER_CACHE_DISABLE");
+   if (!getenv("RADV_X940_DIAG_STOCK_EMPTY_VS_V23") || !cache_off || strcmp(cache_off, "1") ||
+       !binary->info.is_ngg_passthrough || binary->info.wave_size != 32 ||
+       binary->type != RADV_BINARY_TYPE_LEGACY) {
+      fprintf(stderr, "x940-resources-v25: REFUSED: stock GS profile required\n");
+      return false;
+   }
+   static const uint32_t expected[33] = {
+      0xb080400au, 0xb07effffu, 0xbe844780u, 0xbe840008u, 0xbf840003u, 0x9300ff02u,
+      0x00090016u, 0x9301ff03u, 0x00040018u, 0xbf8b0011u, 0xd71f0001u, 0x000100c1u,
+      0xbf870001u, 0xd60b0001u, 0x04054001u, 0xbe81007eu, 0xbf870001u, 0xd4c9007eu,
+      0x00000101u, 0xbfa50002u, 0xf8000941u, 0x00000000u, 0xbf89fff0u, 0xbefe0001u,
+      0x9300ff02u, 0x0009000cu, 0xbe81007eu, 0xd4c9007eu, 0x00000101u, 0xbfa50002u,
+      0xf80008c0u, 0x00000000u, 0xbfb00000u,
+   };
+   struct radv_shader_binary_legacy *bin = (struct radv_shader_binary_legacy *)binary;
+   if (bin->exec_size != sizeof(expected) || bin->code_size != 388 || bin->stats_size != 0 ||
+       binary->total_size < sizeof(*bin) + (size_t)bin->code_size ||
+       memcmp(bin->data, expected, sizeof(expected))) {
+      fprintf(stderr, "x940-resources-v25: REFUSED: stock GS bytes/sizes differ\n");
+      return false;
+   }
+   for (unsigned i = sizeof(expected); i < bin->code_size; i += 4) {
+      uint32_t padding;
+      memcpy(&padding, bin->data + i, sizeof(padding));
+      if (padding != 0xbf9f0000u) {
+         fprintf(stderr, "x940-resources-v25: REFUSED: stock padding differs\n");
+         return false;
+      }
+   }
+   if (binary->config.rsrc1 != 0x282c0041u || binary->config.rsrc2 != 0x00000002u) {
+      fprintf(stderr, "x940-resources-v25: REFUSED: unexpected base RSRC1/2\n");
+      return false;
+   }
+   binary->config.rsrc1 = (binary->config.rsrc1 & ~0x000003c0u) | (2u << 6);
+   binary->config.rsrc2 = (binary->config.rsrc2 & ~0x0000003eu) | (10u << 1);
+   binary->config.num_sgprs = 18;
+   binary->config.num_vgprs = 9;
+   fprintf(stderr, "x940-resources-v25: exact stock GS RSRC1=0x%08x RSRC2=0x%08x SGPRS=2 USER_SGPR=10\n",
+           binary->config.rsrc1, binary->config.rsrc2);
+   return true;
+}
+
 static struct radv_shader_binary *
 shader_compile(struct radv_device *device, struct nir_shader *const *shaders, int shader_count, gl_shader_stage stage,
                const struct radv_shader_info *info, const struct radv_shader_args *args,
@@ -2999,14 +3314,30 @@ shader_compile(struct radv_device *device, struct nir_shader *const *shaders, in
       struct aco_shader_info ac_info;
       struct aco_compiler_options ac_opts;
       radv_aco_convert_opts(&ac_opts, options, args, stage_key);
-      radv_aco_convert_shader_info(&ac_info, info, args, &device->cache_key, options->info->gfx_level);
+      if (device->cache_key.x940_aco_native_gfx11) {
+         fprintf(stderr, "x940-aco-native: stage=%u original=%u compiling=%u\n",
+                 (unsigned)stage, (unsigned)ac_opts.gfx_level, (unsigned)GFX11);
+      }
+      ac_opts.gfx_level = radv_aco_compile_gfx_level(device, ac_opts.gfx_level);
+      radv_aco_convert_shader_info(&ac_info, info, args, &device->cache_key, ac_opts.gfx_level);
+      ac_info.x940_gfx11_wait = device->cache_key.x940_aco_gfx11_wait;
+      ac_info.x940_gfx11_mubuf = device->cache_key.x940_aco_gfx11_mubuf;
+      ac_info.x940_gfx11_sendmsg = device->cache_key.x940_aco_gfx11_sendmsg;
+      ac_info.x940_gfx11_sopp_control = device->cache_key.x940_aco_gfx11_sopp_control;
+      ac_info.x940_gfx11_ngg_salu = device->cache_key.x940_aco_gfx11_ngg_salu;
       aco_compile_shader(&ac_opts, &ac_info, shader_count, shaders, &args->ac, &radv_aco_build_shader_binary,
                          (void **)&binary);
    }
 
    binary->info = *info;
 
-   if (!radv_postprocess_binary_config(device, binary, args)) {
+   if (!radv_x940_stock_empty_vs_v23(device, &binary)) {
+      free(binary);
+      return NULL;
+   }
+
+   if (!radv_postprocess_binary_config(device, binary, args) ||
+       !radv_x940_stock_resources_v25(device, binary)) {
       free(binary);
       return NULL;
    }
@@ -3143,8 +3474,9 @@ radv_create_rt_prolog(struct radv_device *device)
    struct radv_shader_stage_key stage_key = {0};
    struct aco_shader_info ac_info;
    struct aco_compiler_options ac_opts;
-   radv_aco_convert_shader_info(&ac_info, &info, &in_args, &device->cache_key, options.info->gfx_level);
    radv_aco_convert_opts(&ac_opts, &options, &in_args, &stage_key);
+   ac_opts.gfx_level = radv_aco_compile_gfx_level(device, ac_opts.gfx_level);
+   radv_aco_convert_shader_info(&ac_info, &info, &in_args, &device->cache_key, ac_opts.gfx_level);
    aco_compile_rt_prolog(&ac_opts, &ac_info, &in_args.ac, &out_args.ac, &radv_aco_build_shader_binary,
                          (void **)&binary);
    binary->info = info;
@@ -3209,8 +3541,9 @@ radv_create_vs_prolog(struct radv_device *device, const struct radv_vs_prolog_ke
    struct aco_shader_info ac_info;
    struct aco_vs_prolog_info ac_prolog_info;
    struct aco_compiler_options ac_opts;
-   radv_aco_convert_shader_info(&ac_info, &info, &args, &device->cache_key, options.info->gfx_level);
    radv_aco_convert_opts(&ac_opts, &options, &args, &stage_key);
+   ac_opts.gfx_level = radv_aco_compile_gfx_level(device, ac_opts.gfx_level);
+   radv_aco_convert_shader_info(&ac_info, &info, &args, &device->cache_key, ac_opts.gfx_level);
    radv_aco_convert_vs_prolog_key(&ac_prolog_info, key, &args);
    aco_compile_vs_prolog(&ac_opts, &ac_info, &ac_prolog_info, &args.ac, &radv_aco_build_shader_part, (void **)&binary);
 
@@ -3264,8 +3597,9 @@ radv_create_ps_epilog(struct radv_device *device, const struct radv_ps_epilog_ke
    struct aco_shader_info ac_info;
    struct aco_ps_epilog_info ac_epilog_info = {0};
    struct aco_compiler_options ac_opts;
-   radv_aco_convert_shader_info(&ac_info, &info, &args, &device->cache_key, options.info->gfx_level);
    radv_aco_convert_opts(&ac_opts, &options, &args, &stage_key);
+   ac_opts.gfx_level = radv_aco_compile_gfx_level(device, ac_opts.gfx_level);
+   radv_aco_convert_shader_info(&ac_info, &info, &args, &device->cache_key, ac_opts.gfx_level);
    radv_aco_convert_ps_epilog_key(&ac_epilog_info, key, &args);
    aco_compile_ps_epilog(&ac_opts, &ac_info, &ac_epilog_info, &args.ac, &radv_aco_build_shader_part, (void **)&binary);
 

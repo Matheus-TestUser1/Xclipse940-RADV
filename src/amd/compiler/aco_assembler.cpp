@@ -6,6 +6,7 @@
 
 #include "aco_builder.h"
 #include "aco_ir.h"
+#include <cstdlib>
 
 #include "common/sid.h"
 
@@ -13,6 +14,7 @@
 
 #include "ac_shader_util.h"
 #include <algorithm>
+#include <cstdio>
 #include <map>
 #include <vector>
 
@@ -82,7 +84,13 @@ get_vopd_opy_start(const Instruction* instr)
 uint32_t
 reg(asm_context& ctx, PhysReg reg)
 {
-   if (ctx.gfx_level >= GFX11) {
+   /* Diagnostic: the Xclipse 940 uses RDNA3 NULL/M0 selector numbers even
+    * when this port requests GFX10.3 code generation. The environment
+    * switch is scoped to the Vangogh identity used by the Xclipse port.
+    */
+   if (ctx.gfx_level >= GFX11 ||
+       (ctx.gfx_level == GFX10_3 && ctx.program->family == CHIP_VANGOGH &&
+        std::getenv("RADV_X940_ACO_NULL_M0"))) {
       if (reg == m0)
          return sgpr_null.reg();
       else if (reg == sgpr_null)
@@ -136,6 +144,21 @@ emit_sop2_instruction(asm_context& ctx, std::vector<uint32_t>& out, Instruction*
 {
    uint32_t opcode = ctx.opcode[(int)instr->opcode];
 
+   /* The short NGG probes emit these SOP2 operations.
+    * Their GFX10 opcodes decode as different operations on GFX11.
+    */
+   if (ctx.program->info.x940_gfx11_ngg_salu && ctx.gfx_level == GFX10_3 &&
+       (instr->opcode == aco_opcode::s_and_b32 ||
+        instr->opcode == aco_opcode::s_bfe_u32 ||
+        instr->opcode == aco_opcode::s_lshl_b32 ||
+        instr->opcode == aco_opcode::s_bfm_b64 ||
+        instr->opcode == aco_opcode::s_or_b32 ||
+        instr->opcode == aco_opcode::s_bfe_u64)) {
+      const uint32_t old_opcode = opcode;
+      opcode = instr_info.opcode_gfx11[(int)instr->opcode];
+      fprintf(stderr, "x940-aco-ngg-salu: sop2 opcode=0x%x -> 0x%x\n", old_opcode, opcode);
+   }
+
    uint32_t encoding = (0b10 << 30);
    encoding |= opcode << 23;
    encoding |= !instr->definitions.empty() ? reg(ctx, instr->definitions[0]) << 16 : 0;
@@ -181,6 +204,16 @@ emit_sop1_instruction(asm_context& ctx, std::vector<uint32_t>& out, Instruction*
 {
    uint32_t opcode = ctx.opcode[(int)instr->opcode];
 
+   /* MGFX2 stock disassembly uses opcode 0x00 for S_MOV_B32.
+    * Complete the scalar translation used by the short NGG probe.
+    */
+   if (ctx.program->info.x940_gfx11_ngg_salu && ctx.gfx_level == GFX10_3 &&
+       instr->opcode == aco_opcode::s_mov_b32) {
+      const uint32_t old_opcode = opcode;
+      opcode = instr_info.opcode_gfx11[(int)instr->opcode];
+      fprintf(stderr, "x940-aco-ngg-salu: sop1 opcode=0x%x -> 0x%x\n", old_opcode, opcode);
+   }
+
    uint32_t encoding = (0b101111101 << 23);
    encoding |= !instr->definitions.empty() ? reg(ctx, instr->definitions[0]) << 16 : 0;
    encoding |= opcode << 8;
@@ -206,6 +239,63 @@ emit_sopp_instruction(asm_context& ctx, std::vector<uint32_t>& out, Instruction*
 {
    uint32_t opcode = ctx.opcode[(int)instr->opcode];
    SALU_instruction& sopp = instr->salu();
+   uint16_t imm = (uint16_t)sopp.imm;
+
+   /* Xclipse 940 uses GFX10.3 ACO code generation, but the probes
+    * establish that its S_WAITCNT follows the GFX11 opcode and counter
+    * layout. Translate the logical counters at assembly time.
+    * Do not switch the rest of the shader to GFX11.
+    */
+   if (ctx.program->info.x940_gfx11_wait && ctx.gfx_level == GFX10_3 &&
+       instr->opcode == aco_opcode::s_waitcnt) {
+      wait_imm counters;
+      if (!counters.unpack(ctx.gfx_level, instr)) {
+         fprintf(stderr, "x940-aco-wait: cannot decode S_WAITCNT; unchanged\n");
+      } else {
+         opcode = instr_info.opcode_gfx11[(int)instr->opcode];
+         imm = counters.pack(GFX11);
+         fprintf(stderr, "x940-aco-wait: 0x%08x -> 0x%08x\n",
+                 (0b101111111u << 23) | (ctx.opcode[(int)instr->opcode] << 16) |
+                    (uint16_t)sopp.imm,
+                 (0b101111111u << 23) | (opcode << 16) | imm);
+      }
+   }
+
+   /* GFX10's S_SENDMSG opcode is 0x10; GFX11 uses 0x36. Keep the
+    * message immediate untouched. This is scoped to Xclipse 940 and
+    * does not alter other SOPP instructions or shader stages.
+    */
+   if (ctx.program->info.x940_gfx11_sendmsg && ctx.gfx_level == GFX10_3 &&
+       instr->opcode == aco_opcode::s_sendmsg) {
+      const uint32_t old_opcode = opcode;
+      opcode = instr_info.opcode_gfx11[(int)instr->opcode];
+      fprintf(stderr, "x940-aco-sendmsg: opcode=0x%x -> 0x%x imm=0x%x\n",
+              old_opcode, opcode, imm);
+   }
+
+   /* Branch relocation still processes the original logical instruction.
+    * Only the physical opcode changes for these observed NGG controls.
+    */
+   if (ctx.program->info.x940_gfx11_sopp_control && ctx.gfx_level == GFX10_3 &&
+       (instr->opcode == aco_opcode::s_endpgm ||
+        instr->opcode == aco_opcode::s_branch ||
+        instr->opcode == aco_opcode::s_cbranch_scc0 ||
+        instr->opcode == aco_opcode::s_cbranch_scc1 ||
+        instr->opcode == aco_opcode::s_cbranch_execz ||
+        instr->opcode == aco_opcode::s_barrier)) {
+      const uint32_t old_opcode = opcode;
+      opcode = instr_info.opcode_gfx11[(int)instr->opcode];
+      fprintf(stderr, "x940-aco-sopp: opcode=0x%x -> 0x%x imm=0x%x\n",
+              old_opcode, opcode, imm);
+   }
+
+   if (ctx.program->info.x940_gfx11_ngg_salu && ctx.gfx_level == GFX10_3 &&
+       instr->opcode == aco_opcode::s_setprio) {
+      const uint32_t old_opcode = opcode;
+      opcode = instr_info.opcode_gfx11[(int)instr->opcode];
+      fprintf(stderr, "x940-aco-ngg-salu: setprio opcode=0x%x -> 0x%x imm=0x%x\n",
+              old_opcode, opcode, imm);
+   }
 
    uint32_t encoding = (0b101111111 << 23);
    encoding |= opcode << 16;
@@ -215,7 +305,7 @@ emit_sopp_instruction(asm_context& ctx, std::vector<uint32_t>& out, Instruction*
       ctx.branches.emplace_back(out.size(), &sopp);
    } else {
       assert(sopp.imm <= UINT16_MAX);
-      encoding |= (uint16_t)sopp.imm;
+      encoding |= imm;
    }
    out.push_back(encoding);
 }
@@ -531,10 +621,36 @@ void
 emit_mubuf_instruction(asm_context& ctx, std::vector<uint32_t>& out, Instruction* instr)
 {
    uint32_t opcode = ctx.opcode[(int)instr->opcode];
+   /* Diagnostic: Xclipse 940 uses the RDNA3 MUBUF STORE_B32 opcode (0x1a),
+    * whereas the GFX10.3 table selected by this port encodes it as 0x1c
+    * (RDNA3 STORE_B96). Only alter this one instruction when requested.
+    */
+   if (ctx.gfx_level == GFX10_3 && ctx.program->family == CHIP_VANGOGH &&
+       std::getenv("RADV_X940_TEST_BUF_STORE_OPCODE") &&
+       instr->opcode == aco_opcode::buffer_store_dword)
+      opcode = 0x1a;
+
    MUBUF_instruction& mubuf = instr->mubuf();
    bool glc = mubuf.cache.value & ac_glc;
    bool slc = mubuf.cache.value & ac_slc;
    bool dlc = mubuf.cache.value & ac_dlc;
+
+   /* GFX10.3 and GFX11 assign different MUBUF opcodes to dword
+    * accesses. Restrict this diagnostic to the common layout where
+    * only the opcode changes (the byte offset stays in word 0).
+    */
+   if (ctx.program->info.x940_gfx11_mubuf && ctx.gfx_level == GFX10_3 &&
+       (instr->opcode == aco_opcode::buffer_load_dword ||
+        instr->opcode == aco_opcode::buffer_store_dword)) {
+      if (mubuf.lds || mubuf.offen || mubuf.idxen || mubuf.tfe || slc || dlc) {
+         fprintf(stderr, "x940-aco-mubuf: unsupported flags, unchanged opcode=0x%x\n", opcode);
+      } else {
+         const uint32_t old_opcode = opcode;
+         opcode = instr_info.opcode_gfx11[(int)instr->opcode];
+         fprintf(stderr, "x940-aco-mubuf: opcode=0x%x -> 0x%x offset=%u\n",
+                 old_opcode, opcode, mubuf.offset);
+      }
+   }
 
    uint32_t encoding = (0b111000 << 26);
    if (ctx.gfx_level >= GFX11 && mubuf.lds) /* GFX11 has separate opcodes for LDS loads */
@@ -855,6 +971,16 @@ void
 emit_flatlike_instruction(asm_context& ctx, std::vector<uint32_t>& out, Instruction* instr)
 {
    uint32_t opcode = ctx.opcode[(int)instr->opcode];
+   /* Diagnostic only: this port uses GFX10.3 ACO for a GPU with RDNA3
+    * GLOBAL_STORE_B32 opcode and SEG bit positions. Keep all other
+    * instructions on their existing path.
+    */
+   const bool x940_gstore =
+      ctx.gfx_level == GFX10_3 && ctx.program->family == CHIP_VANGOGH &&
+      std::getenv("RADV_X940_TEST_GLOBAL_STORE_RDNA3") &&
+      instr->opcode == aco_opcode::global_store_dword;
+   if (x940_gstore)
+      opcode = 0x1a;
    FLAT_instruction& flat = instr->flatlike();
    bool glc = flat.cache.value & ac_glc;
    bool slc = flat.cache.value & ac_slc;
@@ -880,7 +1006,7 @@ emit_flatlike_instruction(asm_context& ctx, std::vector<uint32_t>& out, Instruct
    if (instr->isScratch())
       encoding |= 1 << (ctx.gfx_level >= GFX11 ? 16 : 14);
    else if (instr->isGlobal())
-      encoding |= 2 << (ctx.gfx_level >= GFX11 ? 16 : 14);
+      encoding |= 2 << ((ctx.gfx_level >= GFX11 || x940_gstore) ? 16 : 14);
    encoding |= flat.lds ? 1 << 13 : 0;
    encoding |= glc ? 1 << (ctx.gfx_level >= GFX11 ? 14 : 16) : 0;
    encoding |= slc ? 1 << (ctx.gfx_level >= GFX11 ? 15 : 17) : 0;

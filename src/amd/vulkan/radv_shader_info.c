@@ -13,6 +13,8 @@
 #include "radv_shader.h"
 
 #include "ac_nir.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 static void
 mark_sampler_desc(const nir_variable *var, struct radv_shader_info *info)
@@ -1494,8 +1496,16 @@ gfx10_get_ngg_info(const struct radv_device *device, struct radv_shader_info *es
                                    gfx_level >= GFX10_3 ? 29
                                                         : 24;
    bool max_vert_out_per_gs_instance = false;
-   unsigned max_esverts_base = 128;
-   unsigned max_gsprims_base = 128; /* default prim group size clamp */
+
+   /*
+    * Xclipse 940 / MGFX2 uses a 64-entry NGG geometry group
+    * for the programming observed on the Samsung PAL driver.
+    *
+    * Keep the normal gfx_level for the rest of NGG calculation;
+    * only the subgroup capacity is MGFX2-specific here.
+    */
+   unsigned max_esverts_base = pdev->info.is_xclipse940 ? 64 : 128;
+   unsigned max_gsprims_base = pdev->info.is_xclipse940 ? 64 : 128; /* default prim group size clamp */
 
    /* Hardware has the following non-natural restrictions on the value
     * of GE_CNTL.VERT_GRP_SIZE based on based on the primitive type of
@@ -1733,6 +1743,12 @@ radv_determine_ngg_settings(struct radv_device *device, struct radv_shader_stage
     */
    es_stage->info.is_ngg_passthrough = !es_stage->info.has_ngg_culling && !(es_stage->stage == MESA_SHADER_VERTEX &&
                                                                             es_stage->info.outinfo.export_prim_id);
+   if (pdev->info.is_xclipse940 && getenv("RADV_X940_DIAG_NGG_NO_PASSTHROUGH")) {
+      es_stage->info.is_ngg_passthrough = false;
+      fprintf(stderr, "x940-ngg-no-passthrough: stage=%u culling=%u passthrough=%u\n",
+              (unsigned)es_stage->stage, (unsigned)es_stage->info.has_ngg_culling,
+              (unsigned)es_stage->info.is_ngg_passthrough);
+   }
 }
 
 static void

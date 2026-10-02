@@ -12,6 +12,7 @@
 #include "radv_buffer.h"
 #include "radv_cp_reg_shadowing.h"
 #include "radv_cs.h"
+#include "ac_x940_reg_v25.h"
 #include "radv_debug.h"
 #include "radv_device_memory.h"
 #include "radv_image.h"
@@ -740,7 +741,9 @@ radv_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
       radeon_emit(cs, CC1_UPDATE_SHADOW_ENABLES(1));
 
       if (has_clear_state) {
-         radeon_emit(cs, PKT3(PKT3_CLEAR_STATE, 0, 0));
+         const bool x940_nop_clear_state =
+            pdev->info.is_xclipse940 && getenv("RADV_X940_NOP_CLEAR_STATE_V16");
+         radeon_emit(cs, PKT3(x940_nop_clear_state ? PKT3_NOP : PKT3_CLEAR_STATE, 0, 0));
          radeon_emit(cs, 0);
       }
    }
@@ -799,8 +802,35 @@ radv_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
 
       if (pdev->info.gfx_level >= GFX10_3) {
          /* This allows sample shading. */
-         radeon_set_context_reg(cs, R_028848_PA_CL_VRS_CNTL,
-                                S_028848_SAMPLE_ITER_COMBINER_MODE(V_028848_SC_VRS_COMB_MODE_OVERRIDE));
+         uint32_t pa_cl_vrs_cntl =
+            S_028848_SAMPLE_ITER_COMBINER_MODE(
+               V_028848_SC_VRS_COMB_MODE_OVERRIDE);
+
+         /*
+          * Xclipse 940 / MGFX2 stock initializes the same physical
+          * PA_CL_VRS_CNTL register to 0x00002200 for this pipeline:
+          *
+          *   SAMPLE_ITER_COMBINER_MODE = OVERRIDE  -> 0x00000200
+          *   EXPOSE_VRS_PIXELS_MASK               -> 0x00002000
+          *
+          * Diagnostic/bring-up only for now.  Dynamic VRS emission has
+          * a separate writer and will need its own MGFX2 handling later.
+          */
+         if (pdev->info.is_xclipse940 &&
+             getenv("RADV_X940_MGFX2_VRS_CNTL_V12")) {
+            const uint32_t old = pa_cl_vrs_cntl;
+
+            pa_cl_vrs_cntl |= 0x00002000u;
+
+            fprintf(stderr,
+                    "x940-vrs-v12: PA_CL_VRS_CNTL[028848] "
+                    "old=0x%08x new=0x%08x\n",
+                    old, pa_cl_vrs_cntl);
+         }
+
+         radeon_set_context_reg(cs,
+                                R_028848_PA_CL_VRS_CNTL,
+                                pa_cl_vrs_cntl);
       }
    }
 
@@ -839,7 +869,7 @@ radv_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
                                 S_0286D4_PNT_SPRITE_OVRD_W(V_0286D4_SPI_PNT_SPRITE_SEL_1) |
                                 S_0286D4_PNT_SPRITE_TOP_1(0)); /* vulkan is top to bottom - 1.0 at bottom */
    } else {
-      radeon_set_context_reg(cs, R_0286D4_SPI_INTERP_CONTROL_0,
+      radeon_set_context_reg(cs, ac_x940_reg_v25(pdev->info.is_xclipse940, R_0286D4_SPI_INTERP_CONTROL_0, AC_X940_SPI_INTERP_CONTROL_0),
                              S_0286D4_FLAT_SHADE_ENA(1) | S_0286D4_PNT_SPRITE_ENA(1) |
                                 S_0286D4_PNT_SPRITE_OVRD_X(V_0286D4_SPI_PNT_SPRITE_SEL_S) |
                                 S_0286D4_PNT_SPRITE_OVRD_Y(V_0286D4_SPI_PNT_SPRITE_SEL_T) |
@@ -1602,6 +1632,42 @@ radv_queue_submit_normal(struct radv_queue *queue, struct vk_queue_submit *submi
                                   &use_perf_counters, &use_ace);
    if (result != VK_SUCCESS)
       return result;
+
+   if (radv_device_physical(device)->info.is_xclipse940 &&
+       getenv("RADV_X940_PREAMBLE_RECORD_ONLY")) {
+      static const char *const names[3] = {
+         "initial-full-flush",
+         "initial-normal",
+         "continue",
+      };
+
+      struct radeon_cmdbuf *preambles[3] = {
+         queue->state.initial_full_flush_preamble_cs,
+         queue->state.initial_preamble_cs,
+         queue->state.continue_preamble_cs,
+      };
+
+      fprintf(stderr,
+              "x940-passive-submit: preambles built; KMD submit skipped\n");
+
+      for (unsigned i = 0; i < 3; i++) {
+         if (!preambles[i])
+            continue;
+
+         fprintf(stderr,
+                 "x940-preamble-dump: BEGIN %s\n",
+                 names[i]);
+
+         device->ws->cs_dump(preambles[i], stderr, NULL, 0,
+                             RADV_CS_DUMP_TYPE_IBS);
+
+         fprintf(stderr,
+                 "x940-preamble-dump: END %s\n",
+                 names[i]);
+      }
+
+      return VK_SUCCESS;
+   }
 
    if (use_ace) {
       result = radv_update_gang_preambles(queue);

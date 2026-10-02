@@ -226,6 +226,19 @@ radv_physical_device_init_cache_key(struct radv_physical_device *pdev)
    key->use_llvm = pdev->use_llvm;
    key->use_ngg = pdev->use_ngg;
    key->use_ngg_culling = pdev->use_ngg_culling;
+   key->x940_aco_gfx11_wait = pdev->info.is_xclipse940 && getenv("RADV_X940_ACO_GFX11_WAIT") != NULL;
+   key->x940_aco_gfx11_mubuf = pdev->info.is_xclipse940 && getenv("RADV_X940_ACO_GFX11_MUBUF") != NULL;
+   key->x940_aco_gfx11_sendmsg = pdev->info.is_xclipse940 && getenv("RADV_X940_ACO_GFX11_SENDMSG") != NULL;
+   key->x940_aco_gfx11_sopp_control =
+      pdev->info.is_xclipse940 && getenv("RADV_X940_ACO_GFX11_SOPP_CONTROL") != NULL;
+   key->x940_aco_gfx11_ngg_salu = pdev->info.is_xclipse940 && getenv("RADV_X940_ACO_GFX11_NGG_SALU") != NULL;
+   key->x940_aco_native_gfx11 = pdev->info.is_xclipse940 &&
+                                getenv("RADV_X940_DIAG_ACO_NATIVE_GFX11") != NULL;
+   key->x940_aco_null_m0 = pdev->info.is_xclipse940 && getenv("RADV_X940_ACO_NULL_M0") != NULL;
+   key->x940_aco_test_buf_store_opcode =
+      pdev->info.is_xclipse940 && getenv("RADV_X940_TEST_BUF_STORE_OPCODE") != NULL;
+   key->x940_aco_test_global_store_rdna3 =
+      pdev->info.is_xclipse940 && getenv("RADV_X940_TEST_GLOBAL_STORE_RDNA3") != NULL;
 }
 
 static int
@@ -2229,7 +2242,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
    /* Determine the number of threads per wave for all stages. */
    pdev->cs_wave_size = 64;
    pdev->ps_wave_size = 64;
-   pdev->ge_wave_size = 64;
+   pdev->ge_wave_size = pdev->info.is_xclipse940 ? 32 : 64;
    pdev->rt_wave_size = 64;
 
    if (pdev->info.gfx_level >= GFX10) {

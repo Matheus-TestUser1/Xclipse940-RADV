@@ -8,6 +8,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdio.h>
+#include <stdlib.h>
 #include "radv_cp_dma.h"
 #include "radv_buffer.h"
 #include "radv_cs.h"
@@ -266,12 +268,28 @@ radv_cp_dma_buffer_copy(struct radv_cmd_buffer *cmd_buffer, uint64_t src_va, uin
           * which is 4k at the moment, so this is really unlikely to cause
           * significant thrashing.
           */
-         dma_flags |= CP_DMA_USE_L2;
+         if (pdev->info.is_xclipse940 && getenv("RADV_X940_CPDMA_BYPASS_L2")) {
+            fprintf(stderr, "x940-cpdma-bypass-l2: bytes=%u src=0x%016llx dst=0x%016llx\n",
+                    byte_count, (unsigned long long)main_src_va,
+                    (unsigned long long)main_dest_va);
+         } else {
+            dma_flags |= CP_DMA_USE_L2;
+         }
       }
 
       radv_cp_dma_prepare(cmd_buffer, byte_count, size + skipped_size + realign_size, &dma_flags);
 
-      dma_flags &= ~CP_DMA_SYNC;
+      /* SGPU diagnostic: sync the last nonzero copy packet instead of using
+       * the zero-byte dummy packet in radv_cp_dma_wait_for_idle().
+       */
+      if (pdev->info.is_xclipse940 && getenv("RADV_X940_SYNC_LAST_COPY")) {
+         if (dma_flags & CP_DMA_SYNC)
+            fprintf(stderr, "x940-cpdma-last-sync: bytes=%u src=0x%016llx dst=0x%016llx flags=0x%x\n",
+                    byte_count, (unsigned long long)main_src_va,
+                    (unsigned long long)main_dest_va, dma_flags);
+      } else {
+         dma_flags &= ~CP_DMA_SYNC;
+      }
 
       radv_emit_cp_dma(cmd_buffer, main_dest_va, main_src_va, byte_count, dma_flags);
 

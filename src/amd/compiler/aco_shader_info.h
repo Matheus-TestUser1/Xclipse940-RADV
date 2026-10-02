@@ -139,6 +139,13 @@ struct aco_shader_info {
    uint32_t gfx9_gs_ring_lds_size;
 
    bool is_trap_handler_shader;
+
+   /* Experimental, RADV Xclipse 940 only: encode S_WAITCNT as GFX11. */
+   bool x940_gfx11_wait;
+   bool x940_gfx11_mubuf; /* Experimental plain dword MUBUF encoding. */
+   bool x940_gfx11_sendmsg; /* Diagnostic NGG S_SENDMSG encoding. */
+   bool x940_gfx11_sopp_control; /* Diagnostic NGG control encoding. */
+   bool x940_gfx11_ngg_salu; /* Diagnostic scalar ALU encoding. */
 };
 
 enum aco_compiler_debug_level {

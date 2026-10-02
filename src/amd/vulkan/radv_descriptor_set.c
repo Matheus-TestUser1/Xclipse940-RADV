@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "ac_descriptors.h"
 #include "radv_buffer.h"
@@ -917,10 +918,32 @@ radv_create_descriptor_pool(struct radv_device *device, const VkDescriptorPoolCr
       if (!(pCreateInfo->flags & VK_DESCRIPTOR_POOL_CREATE_HOST_ONLY_BIT_EXT)) {
          enum radeon_bo_flag flags = RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_READ_ONLY | RADEON_FLAG_32BIT;
 
+         /* Diagnostic: compare the exact same descriptor BO in a normal high VA. */
+         if (pdev->info.is_xclipse940 && getenv("RADV_X940_DIAG_DESC_OUTSIDE_32BIT"))
+            flags &= ~RADEON_FLAG_32BIT;
+
+         enum radeon_bo_domain domain = RADEON_DOMAIN_VRAM;
+
+         /* Samsung SGPU is UMA and the kernel forces VRAM requests into GTT.
+          * Allocate descriptor memory as GTT explicitly on Xclipse 940 so the
+          * BO placement matches the KMD model from the start.  Keep READ_ONLY:
+          * the shader only reads descriptor memory, and the VM map still gets
+          * AMDGPU_VM_PAGE_READABLE. CPU_ACCESS is needed because descriptor
+          * records are populated from the CPU.
+          *
+          * Do not add GTT_WC here. S5E9945 enables
+          * CONFIG_DRM_SGPU_FORCE_WRITECOMBINE by default and the KMD adds
+          * AMDGPU_GEM_CREATE_CPU_GTT_USWC for non-coherent SGPU allocations.
+          */
+         if (pdev->info.is_xclipse940) {
+            domain = RADEON_DOMAIN_GTT;
+            flags |= RADEON_FLAG_CPU_ACCESS;
+         }
+
          if (instance->drirc.zero_vram)
             flags |= RADEON_FLAG_ZERO_VRAM;
 
-         VkResult result = radv_bo_create(device, &pool->base, bo_size, 32, RADEON_DOMAIN_VRAM, flags,
+         VkResult result = radv_bo_create(device, &pool->base, bo_size, 32, domain, flags,
                                           RADV_BO_PRIORITY_DESCRIPTOR, 0, false, &pool->bo);
          if (result != VK_SUCCESS) {
             radv_destroy_descriptor_pool(device, pAllocator, pool);
@@ -1093,6 +1116,14 @@ write_buffer_descriptor(struct radv_device *device, unsigned *dst, uint64_t va, 
     * more efficient 8/16-bit buffer accesses.
     */
    ac_build_raw_buffer_descriptor(pdev->info.gfx_level, va, align(range, 4), dst);
+   /* Diagnostic: GFX11 leaves RESOURCE_LEVEL (DW3 bit 24) clear.
+    * This port presents Xclipse 940 as GFX10.3, which sets the bit.
+    */
+   if (pdev->info.is_xclipse940 && getenv("RADV_X940_TEST_DESC_LEVEL0")) {
+      uint32_t before = dst[3];
+      dst[3] &= ~(1u << 24);
+      fprintf(stderr, "x940-desc-level0: old=0x%08x new=0x%08x\n", before, dst[3]);
+   }
    if (pdev->info.is_xclipse940) {
    fprintf(stderr,
            "x940-desc: target_va=0x%016llx target_hi=0x%08x "

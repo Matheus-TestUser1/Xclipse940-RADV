@@ -57,6 +57,12 @@ struct radv_device_cache_key {
    uint32_t image_2d_view_of_3d : 1;
    uint32_t mesh_shader_queries : 1;
    uint32_t primitives_generated_query : 1;
+   uint32_t x940_aco_gfx11_wait : 1;
+   uint32_t x940_aco_gfx11_mubuf : 1;
+   uint32_t x940_aco_gfx11_sendmsg : 1;
+   uint32_t x940_aco_gfx11_sopp_control : 1;
+   uint32_t x940_aco_gfx11_ngg_salu : 1;
+   uint32_t x940_aco_native_gfx11 : 1;
 };
 
 enum radv_force_vrs {

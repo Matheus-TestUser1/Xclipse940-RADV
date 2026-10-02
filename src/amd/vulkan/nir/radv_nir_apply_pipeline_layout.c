@@ -14,10 +14,16 @@
 #include "radv_shader.h"
 #include "radv_shader_args.h"
 #include "sid.h"
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 typedef struct {
    enum amd_gfx_level gfx_level;
    uint32_t address32_hi;
+   bool is_xclipse940;
+   bool xclipse940_vmem_descriptor_test;
    bool disable_aniso_single_level;
    bool has_image_load_dcc_bug;
    bool disable_tg4_trunc_coord;
@@ -43,6 +49,23 @@ convert_pointer_to_64_bit(nir_builder *b, apply_layout_state *state, nir_def *pt
 static nir_def *
 load_desc_ptr(nir_builder *b, apply_layout_state *state, unsigned set)
 {
+   /* Diagnostic: bypass the user SGPR carrying descriptor set 0's low VA.
+    * The ordinary shader path is unchanged when the variable is unset.
+    */
+   if (state->is_xclipse940 && state->info->stage == MESA_SHADER_COMPUTE && set == 0) {
+      const char *requested = getenv("RADV_X940_FORCE_DESC_LOW32");
+      if (requested && *requested) {
+         char *end = NULL;
+         errno = 0;
+         unsigned long forced = strtoul(requested, &end, 0);
+         if (!errno && end != requested && !*end && forced <= UINT32_MAX) {
+            fprintf(stderr, "x940-desc-force: set=0 low32=0x%08lx (SGPR bypass)\n", forced);
+            return nir_imm_int(b, (uint32_t)forced);
+         }
+         fprintf(stderr, "x940-desc-force: invalid low32 '%s'\n", requested);
+      }
+   }
+
    const struct radv_userdata_locations *user_sgprs_locs = &state->info->user_sgprs_locs;
    if (user_sgprs_locs->shader_data[AC_UD_INDIRECT_DESCRIPTOR_SETS].sgpr_idx != -1) {
       nir_def *addr = get_scalar_arg(b, 1, state->args->descriptor_sets[0]);
@@ -175,7 +198,17 @@ visit_get_ssbo_size(nir_builder *b, apply_layout_state *state, nir_intrinsic_ins
    nir_def *rsrc = intrin->src[0].ssa;
 
    nir_def *size;
-   if (nir_intrinsic_access(intrin) & ACCESS_NON_UNIFORM) {
+   if (state->xclipse940_vmem_descriptor_test) {
+      /* Diagnostic for OpArrayLength only: read the descriptor's size dword
+       * (offset 8) through VMEM instead of s_load_dwordx4. Do not use this
+       * path as a driver fix without checking performance and correctness.
+       */
+      nir_def *offset = nir_iadd_imm(b, nir_channel(b, rsrc, 1), 8);
+      nir_def *low = nir_iadd(b, nir_channel(b, rsrc, 0), offset);
+      nir_def *ptr = convert_pointer_to_64_bit(b, state, low);
+      size = nir_build_load_global(b, 1, 32, ptr, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER,
+                                   .align_mul = 4);
+   } else if (nir_intrinsic_access(intrin) & ACCESS_NON_UNIFORM) {
       nir_def *ptr = nir_iadd(b, nir_channel(b, rsrc, 0), nir_channel(b, rsrc, 1));
       ptr = nir_iadd_imm(b, ptr, 8);
       ptr = convert_pointer_to_64_bit(b, state, ptr);
@@ -538,7 +571,9 @@ radv_nir_apply_pipeline_layout(nir_shader *shader, struct radv_device *device, c
 
    apply_layout_state state = {
       .gfx_level = pdev->info.gfx_level,
+      .is_xclipse940 = pdev->info.is_xclipse940,
       .address32_hi = pdev->info.address32_hi,
+      .xclipse940_vmem_descriptor_test = pdev->info.is_xclipse940,
       .disable_aniso_single_level = instance->drirc.disable_aniso_single_level,
       .has_image_load_dcc_bug = pdev->info.has_image_load_dcc_bug,
       .disable_tg4_trunc_coord = !pdev->info.conformant_trunc_coord && !device->disable_trunc_coord,

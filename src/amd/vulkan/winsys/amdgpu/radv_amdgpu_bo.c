@@ -6,6 +6,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include <errno.h>
 #include "radv_amdgpu_bo.h"
@@ -38,7 +39,14 @@ radv_amdgpu_bo_va_op(struct radv_amdgpu_winsys *ws, amdgpu_bo_handle bo, uint64_
 
    size = align64(size, getpagesize());
 
-   return amdgpu_bo_va_op_raw(ws->dev, bo, offset, size, addr, flags, ops);
+   int result = amdgpu_bo_va_op_raw(ws->dev, bo, offset, size, addr, flags, ops);
+   if (ws->info.is_xclipse940 && getenv("RADV_X940_LOG_VA")) {
+      fprintf(stderr,
+              "x940-vm: op=%u va=0x%016llx size=0x%llx flags=0x%llx has_bo=%u result=%d\n",
+              ops, (unsigned long long)addr, (unsigned long long)size,
+              (unsigned long long)flags, bo != NULL, result);
+   }
+   return result;
 }
 
 static int
@@ -463,8 +471,16 @@ radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned 
       request.flags |= AMDGPU_GEM_CREATE_EXPLICIT_SYNC;
    if ((initial_domain & RADEON_DOMAIN_VRAM_GTT) && (flags & RADEON_FLAG_NO_INTERPROCESS_SHARING) &&
        ((ws->perftest & RADV_PERFTEST_LOCAL_BOS) || (flags & RADEON_FLAG_PREFER_LOCAL_BO))) {
+      /* Local BOs are intentionally omitted from RADV's global BO list.
+       * That is only correct when the KMD owns their residency and keeps the
+       * mapping valid in this VM. Samsung's SGPU implements
+       * AMDGPU_GEM_CREATE_VM_ALWAYS_VALID, so request the semantic that
+       * bo->base.is_local represents instead of merely setting the userspace
+       * bookkeeping bit. Without this, BDA/global-list workloads can submit
+       * successfully while shader data accesses hit an invalid PTE.
+       */
+      request.flags |= AMDGPU_GEM_CREATE_VM_ALWAYS_VALID;
       bo->base.is_local = true;
-      
    }
 
    if (initial_domain & RADEON_DOMAIN_VRAM) {

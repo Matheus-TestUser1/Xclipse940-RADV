@@ -63,6 +63,7 @@ typedef void *drmDevicePtr;
 #include "winsys/null/radv_null_winsys_public.h"
 #include "git_sha1.h"
 #include "sid.h"
+#include "ac_x940_reg_v25.h"
 #include "vk_common_entrypoints.h"
 #include "vk_format.h"
 #include "vk_sync.h"
@@ -854,6 +855,19 @@ radv_device_init_cache_key(struct radv_device *device)
    key->image_2d_view_of_3d = device->vk.enabled_features.image2DViewOf3D && pdev->info.gfx_level == GFX9;
    key->mesh_shader_queries = device->vk.enabled_features.meshShaderQueries;
    key->primitives_generated_query = radv_uses_primitives_generated_query(device);
+   /* These ACO modes change compiled ISA: keep their cache entries separate. */
+   key->x940_aco_gfx11_wait = pdev->info.is_xclipse940 &&
+                              getenv("RADV_X940_ACO_GFX11_WAIT") != NULL;
+   key->x940_aco_gfx11_mubuf = pdev->info.is_xclipse940 &&
+                               getenv("RADV_X940_ACO_GFX11_MUBUF") != NULL;
+   key->x940_aco_gfx11_sendmsg = pdev->info.is_xclipse940 &&
+                                 getenv("RADV_X940_ACO_GFX11_SENDMSG") != NULL;
+   key->x940_aco_gfx11_sopp_control = pdev->info.is_xclipse940 &&
+                                      getenv("RADV_X940_ACO_GFX11_SOPP_CONTROL") != NULL;
+   key->x940_aco_gfx11_ngg_salu = pdev->info.is_xclipse940 &&
+                                  getenv("RADV_X940_ACO_GFX11_NGG_SALU") != NULL;
+   key->x940_aco_native_gfx11 = pdev->info.is_xclipse940 &&
+                                getenv("RADV_X940_DIAG_ACO_NATIVE_GFX11") != NULL;
 
    /* The Vulkan spec says:
     *  "Binary shaders retrieved from a physical device with a certain shaderBinaryUUID are
@@ -883,6 +897,17 @@ radv_create_gfx_preamble(struct radv_device *device)
    radv_emit_graphics(device, cs);
 
    device->ws->cs_pad(cs, 0);
+
+   /* Inspect the graphics initialization IB before it is uploaded.  The
+    * normal command buffer dump only shows the main IB and omits this state.
+    * Keep the dump read-only so record-only probes cannot change GPU state.
+    */
+   if (radv_device_physical(device)->info.is_xclipse940 && getenv("RADV_X940_DIAG_DUMP_GFX_PREAMBLE")) {
+      fprintf(stderr, "x940-gfx-preamble: begin words=%llu\n", (unsigned long long)cs->cdw);
+      for (unsigned i = 0; i < cs->cdw; i++)
+         fprintf(stderr, "0x%08x\n", cs->buf[i]);
+      fprintf(stderr, "x940-gfx-preamble: end\n");
+   }
 
    VkResult result = radv_bo_create(
       device, NULL, cs->cdw * 4, 4096, device->ws->cs_domain(device->ws),
@@ -1010,7 +1035,7 @@ radv_emit_default_sample_locations(const struct radv_physical_device *pdev, stru
    if (pdev->info.gfx_level >= GFX12) {
       radeon_set_context_reg_seq(cs, R_028BF0_PA_SC_CENTROID_PRIORITY_0, 2);
    } else {
-      radeon_set_context_reg_seq(cs, R_028BD4_PA_SC_CENTROID_PRIORITY_0, 2);
+      radeon_set_context_reg_seq(cs, ac_x940_reg_v25(pdev->info.is_xclipse940, R_028BD4_PA_SC_CENTROID_PRIORITY_0, AC_X940_PA_SC_CENTROID_PRIORITY_0), 2);
    }
    radeon_emit(cs, centroid_priority);
    radeon_emit(cs, centroid_priority >> 32);

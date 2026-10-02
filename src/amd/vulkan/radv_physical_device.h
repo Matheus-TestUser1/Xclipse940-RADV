@@ -67,6 +67,16 @@ struct radv_physical_device_cache_key {
    uint32_t use_llvm : 1;
    uint32_t use_ngg : 1;
    uint32_t use_ngg_culling : 1;
+   /* Xclipse ACO diagnostics change ISA and must change the pipeline cache UUID. */
+   uint32_t x940_aco_gfx11_wait : 1;
+   uint32_t x940_aco_gfx11_mubuf : 1;
+   uint32_t x940_aco_gfx11_sendmsg : 1;
+   uint32_t x940_aco_gfx11_sopp_control : 1;
+   uint32_t x940_aco_gfx11_ngg_salu : 1;
+   uint32_t x940_aco_native_gfx11 : 1;
+   uint32_t x940_aco_null_m0 : 1;
+   uint32_t x940_aco_test_buf_store_opcode : 1;
+   uint32_t x940_aco_test_global_store_rdna3 : 1;
 };
 
 enum radv_video_enc_hw_ver {

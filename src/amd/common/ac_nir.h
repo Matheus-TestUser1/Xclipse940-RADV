@@ -140,6 +140,7 @@ typedef struct {
    unsigned num_vertices_per_primitive;
    bool early_prim_export;
    bool passthrough;
+   bool passthrough_no_msg;
    bool use_edgeflags;
    bool export_primitive_id;
    uint32_t instance_rate_inputs;

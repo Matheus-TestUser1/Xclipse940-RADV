@@ -1671,6 +1671,47 @@ radv_amdgpu_ctx_destroy(struct radeon_winsys_ctx *rwctx)
 {
    struct radv_amdgpu_ctx *ctx = (struct radv_amdgpu_ctx *)rwctx;
 
+   if (ctx->ws->info.is_sgpu &&
+       getenv("RADV_X940_DIAG_KMD_RESET")) {
+      uint64_t reset_flags = 0;
+      uint32_t reset_state = 0;
+      uint32_t hangs = 0;
+
+      int qr2 = amdgpu_cs_query_reset_state2(ctx->ctx, &reset_flags);
+      int qr1 = amdgpu_cs_query_reset_state(ctx->ctx, &reset_state, &hangs);
+
+      fprintf(stderr,
+              "x940-kmd-reset: q2=%d flags=0x%016llx "
+              "q1=%d state=%u hangs=%u\\n",
+              qr2,
+              (unsigned long long)reset_flags,
+              qr1,
+              reset_state,
+              hangs);
+
+      for (unsigned ip = 0; ip <= AMDGPU_HW_IP_NUM; ++ip) {
+         for (unsigned ring = 0; ring < MAX_RINGS_PER_TYPE; ++ring) {
+            struct amdgpu_cs_fence *f =
+               &ctx->last_submission[ip][ring].fence;
+
+            if (!f->fence)
+               continue;
+
+            uint32_t expired = 0;
+            int fr = amdgpu_cs_query_fence_status(f, 0, 0, &expired);
+
+            fprintf(stderr,
+                    "x940-kmd-fence: ip=%u ring=%u seq=%llu "
+                    "query=%d expired=%u\\n",
+                    ip,
+                    ring,
+                    (unsigned long long)f->fence,
+                    fr,
+                    expired);
+         }
+      }
+   }
+
    for (unsigned ip = 0; ip <= AMDGPU_HW_IP_NUM; ++ip) {
       for (unsigned ring = 0; ring < MAX_RINGS_PER_TYPE; ++ring) {
          if (ctx->queue_syncobj[ip][ring])
@@ -1972,13 +2013,85 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
          os_time_sleep(1000);
 
       r = amdgpu_cs_submit_raw2(ctx->ws->dev, ctx->ctx, 0, num_chunks, chunks, &request->seq_no);
+      if (getenv("RADV_X940_DIAG_SUBMIT_RAW")) {
+         fprintf(stderr, "x940-submit-raw2: r=%d seq_no=%llu ip=%u ring=%u chunks=%d\n",
+                 r, (unsigned long long)request->seq_no,
+                 request->ip_type, request->ring, num_chunks);
+
+         for (int _di = 0; _di < num_chunks; _di++)
+            fprintf(stderr, "  chunk[%d]: id=0x%x dw=%u\n",
+                    _di, chunks[_di].chunk_id, chunks[_di].length_dw);
+
+         fprintf(stderr, "x940-submit-ibs: count=%u bo_handles=%u\n",
+                 request->number_of_ibs, request->num_handles);
+
+         for (unsigned _ii = 0; _ii < request->number_of_ibs; _ii++) {
+            const struct radv_amdgpu_cs_ib_info *_ib = &request->ibs[_ii];
+
+            fprintf(stderr,
+                    "  ib[%u]: va=0x%016llx dw=%u bytes=%u ip=%u flags=0x%llx\n",
+                    _ii,
+                    (unsigned long long)_ib->ib_mc_address,
+                    _ib->size,
+                    _ib->size * 4,
+                    _ib->ip_type,
+                    (unsigned long long)_ib->flags);
+         }
+      }
    } while (r == -ENOMEM && os_time_get_nano() < abs_timeout_ns);
+
+   if (!r && ctx->ws->info.is_xclipse940 &&
+       getenv("RADV_X940_DIAG_RAW_FENCE")) {
+      struct amdgpu_cs_fence raw_fence = {
+         .context = ctx->ctx,
+         .ip_type = request->ip_type,
+         .ring = request->ring,
+         .fence = request->seq_no,
+      };
+
+      uint32_t expired = 0;
+      uint64_t t0 = os_time_get_nano();
+
+      int fr = amdgpu_cs_query_fence_status(
+         &raw_fence, 0, 0, &expired);
+
+      uint64_t elapsed_ns = os_time_get_nano() - t0;
+
+      uint64_t reset_flags = 0;
+      uint32_t reset_state = 0;
+      uint32_t hangs = 0;
+
+      int qr2 = amdgpu_cs_query_reset_state2(ctx->ctx, &reset_flags);
+      int qr1 = amdgpu_cs_query_reset_state(ctx->ctx,
+                                           &reset_state,
+                                           &hangs);
+
+      fprintf(stderr,
+              "x940-raw-fence: seq=%llu ip=%u ring=%u "
+              "query=%d expired=%u elapsed_ms=%.3f\\n",
+              (unsigned long long)request->seq_no,
+              request->ip_type,
+              request->ring,
+              fr,
+              expired,
+              (double)elapsed_ns / 1000000.0);
+
+      fprintf(stderr,
+              "x940-raw-reset: q2=%d flags=0x%016llx "
+              "q1=%d state=%u hangs=%u\\n",
+              qr2,
+              (unsigned long long)reset_flags,
+              qr1,
+              reset_state,
+              hangs);
+   }
 
    /* Legacy SGPU fallback only. Never force a fence to "expired": doing so
     * tells userspace work completed before the GPU actually completed it.
     * Xclipse 940 uses the kernel's real syncobj signaling above.
     */
-   if (!r && ctx->ws->info.is_sgpu && !ctx->ws->info.is_xclipse940) {
+   if (!r && ctx->ws->info.is_sgpu &&
+       getenv("RADV_X940_LEGACY_FENCE_TEST")) {
       struct amdgpu_cs_fence fence = {
          .context = ctx->ctx,
          .ip_type = request->ip_type,

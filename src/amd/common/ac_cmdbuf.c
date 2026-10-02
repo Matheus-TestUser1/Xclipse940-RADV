@@ -10,8 +10,12 @@
 #include "ac_shader_util.h"
 
 #include "sid.h"
+#include "ac_x940_reg_v25.h"
 
 #include "util/u_math.h"
+
+#include <stdio.h>
+#include <stdlib.h>
 
 #define SI_GS_PER_ES 128
 
@@ -255,7 +259,7 @@ gfx6_init_graphics_preamble_state(const struct ac_preamble_state *state,
    }
 
    if (info->gfx_level >= GFX7) {
-      ac_pm4_set_reg_idx3(pm4, R_00B01C_SPI_SHADER_PGM_RSRC3_PS,
+      ac_pm4_set_reg_idx3(pm4, ac_x940_reg_v25(info->is_xclipse940, R_00B01C_SPI_SHADER_PGM_RSRC3_PS, AC_X940_SPI_SHADER_PGM_RSRC3_PS),
                           ac_apply_cu_en(S_00B01C_CU_EN(0xffffffff) |
                                          S_00B01C_WAVE_LIMIT_GFX7(0x3F),
                                          C_00B01C_CU_EN, 0, info));
@@ -283,7 +287,7 @@ gfx6_init_graphics_preamble_state(const struct ac_preamble_state *state,
       ac_pm4_set_reg(pm4, R_00B214_SPI_SHADER_PGM_HI_ES,
                      S_00B214_MEM_BASE(info->address32_hi >> 8));
    } else {
-      ac_pm4_set_reg(pm4, R_00B524_SPI_SHADER_PGM_HI_LS,
+      ac_pm4_set_reg(pm4, ac_x940_reg_v25(info->is_xclipse940, R_00B524_SPI_SHADER_PGM_HI_LS, AC_X940_SPI_SHADER_PGM_HI_LS),
                      S_00B524_MEM_BASE(info->address32_hi >> 8));
    }
 
@@ -291,7 +295,7 @@ gfx6_init_graphics_preamble_state(const struct ac_preamble_state *state,
       ac_pm4_set_reg(pm4, R_00B51C_SPI_SHADER_PGM_RSRC3_LS,
                      ac_apply_cu_en(S_00B51C_CU_EN(0xffff) | S_00B51C_WAVE_LIMIT(0x3F),
                                     C_00B51C_CU_EN, 0, info));
-      ac_pm4_set_reg(pm4, R_00B41C_SPI_SHADER_PGM_RSRC3_HS, S_00B41C_WAVE_LIMIT(0x3F));
+      ac_pm4_set_reg(pm4, ac_x940_reg_v25(info->is_xclipse940, R_00B41C_SPI_SHADER_PGM_RSRC3_HS, AC_X940_SPI_SHADER_PGM_RSRC3_HS), S_00B41C_WAVE_LIMIT(0x3F));
       ac_pm4_set_reg(pm4, R_00B31C_SPI_SHADER_PGM_RSRC3_ES,
                      ac_apply_cu_en(S_00B31C_CU_EN(0xffff) | S_00B31C_WAVE_LIMIT(0x3F),
                                     C_00B31C_CU_EN, 0, info));
@@ -338,7 +342,7 @@ gfx6_init_graphics_preamble_state(const struct ac_preamble_state *state,
 
       ac_pm4_set_reg(pm4, R_028060_DB_DFSM_CONTROL, S_028060_PUNCHOUT_MODE(V_028060_FORCE_OFF));
 
-      ac_pm4_set_reg_idx3(pm4, R_00B41C_SPI_SHADER_PGM_RSRC3_HS,
+      ac_pm4_set_reg_idx3(pm4, ac_x940_reg_v25(info->is_xclipse940, R_00B41C_SPI_SHADER_PGM_RSRC3_HS, AC_X940_SPI_SHADER_PGM_RSRC3_HS),
                           ac_apply_cu_en(S_00B41C_CU_EN(0xffff) | S_00B41C_WAVE_LIMIT(0x3F),
                                          C_00B41C_CU_EN, 0, info));
 
@@ -385,7 +389,7 @@ gfx10_init_graphics_preamble_state(const struct ac_preamble_state *state,
    }
 
    const unsigned cu_mask_ps = info->gfx_level >= GFX10_3 ? ac_gfx103_get_cu_mask_ps(info) : ~0u;
-   ac_pm4_set_reg_idx3(pm4, R_00B01C_SPI_SHADER_PGM_RSRC3_PS,
+   ac_pm4_set_reg_idx3(pm4, ac_x940_reg_v25(info->is_xclipse940, R_00B01C_SPI_SHADER_PGM_RSRC3_PS, AC_X940_SPI_SHADER_PGM_RSRC3_PS),
                        ac_apply_cu_en(S_00B01C_CU_EN(cu_mask_ps) |
                                       S_00B01C_WAVE_LIMIT_GFX7(0x3F) |
                                       S_00B01C_LDS_GROUP_SIZE_GFX11(info->gfx_level >= GFX11),
@@ -416,7 +420,7 @@ gfx10_init_graphics_preamble_state(const struct ac_preamble_state *state,
                                             C_00B004_CU_EN, 16, info));
 
       /* Shader registers - HS. */
-      ac_pm4_set_reg_idx3(pm4, R_00B404_SPI_SHADER_PGM_RSRC4_HS,
+      ac_pm4_set_reg_idx3(pm4, ac_x940_reg_v25(info->is_xclipse940, R_00B404_SPI_SHADER_PGM_RSRC4_HS, AC_X940_SPI_SHADER_PGM_RSRC4_HS),
                           ac_apply_cu_en(S_00B404_CU_EN(0xffff), /* CUs 16-31 */
                                          C_00B404_CU_EN, 16, info));
    }
@@ -426,25 +430,36 @@ gfx10_init_graphics_preamble_state(const struct ac_preamble_state *state,
    ac_pm4_set_reg(pm4, R_00B2CC_SPI_SHADER_USER_ACCUM_ESGS_1, 0);
    ac_pm4_set_reg(pm4, R_00B2D0_SPI_SHADER_USER_ACCUM_ESGS_2, 0);
    ac_pm4_set_reg(pm4, R_00B2D4_SPI_SHADER_USER_ACCUM_ESGS_3, 0);
-   ac_pm4_set_reg(pm4, R_00B324_SPI_SHADER_PGM_HI_ES,
-                  S_00B324_MEM_BASE(info->address32_hi >> 8));
+   /*
+    * Xclipse 940 / MGFX2 has ES PGM_HI at 0x00b21c.
+    * 0x00b324 belongs to the generic GFX10.x register map and must
+    * not be used as SPI_SHADER_PGM_HI_ES on MGFX2.
+    *
+    * The actual X940 shader PGM_LO/HI pair is programmed later by
+    * the RADV NGG emission path at b218/b21c.
+    */
+   if (!info->is_xclipse940) {
+      ac_pm4_set_reg(pm4, R_00B324_SPI_SHADER_PGM_HI_ES,
+                     S_00B324_MEM_BASE(info->address32_hi >> 8));
+   }
 
-   ac_pm4_set_reg_idx3(pm4, R_00B41C_SPI_SHADER_PGM_RSRC3_HS,
+   ac_pm4_set_reg_idx3(pm4, ac_x940_reg_v25(info->is_xclipse940, R_00B41C_SPI_SHADER_PGM_RSRC3_HS, AC_X940_SPI_SHADER_PGM_RSRC3_HS),
                        ac_apply_cu_en(S_00B41C_CU_EN(0xffff) | S_00B41C_WAVE_LIMIT(0x3F),
                                       C_00B41C_CU_EN, 0, info));
    ac_pm4_set_reg(pm4, R_00B4C8_SPI_SHADER_USER_ACCUM_LSHS_0, 0);
    ac_pm4_set_reg(pm4, R_00B4CC_SPI_SHADER_USER_ACCUM_LSHS_1, 0);
    ac_pm4_set_reg(pm4, R_00B4D0_SPI_SHADER_USER_ACCUM_LSHS_2, 0);
    ac_pm4_set_reg(pm4, R_00B4D4_SPI_SHADER_USER_ACCUM_LSHS_3, 0);
-   ac_pm4_set_reg(pm4, R_00B524_SPI_SHADER_PGM_HI_LS,
+   ac_pm4_set_reg(pm4, ac_x940_reg_v25(info->is_xclipse940, R_00B524_SPI_SHADER_PGM_HI_LS, AC_X940_SPI_SHADER_PGM_HI_LS),
                   S_00B524_MEM_BASE(info->address32_hi >> 8));
 
    /* Context registers. */
-   if (info->gfx_level < GFX11) {
+   /* MGFX2 has no DB_DFSM_CONTROL at 028038: this is DB_HTILE_DATA_BASE. */
+   if (info->gfx_level < GFX11 && !info->is_xclipse940) {
       ac_pm4_set_reg(pm4, R_028038_DB_DFSM_CONTROL, S_028038_PUNCHOUT_MODE(V_028038_FORCE_OFF));
    }
 
-   ac_pm4_set_reg(pm4, R_02807C_DB_RMI_L2_CACHE_CONTROL,
+   ac_pm4_set_reg(pm4, ac_x940_reg_v25(info->is_xclipse940, R_02807C_DB_RMI_L2_CACHE_CONTROL, AC_X940_DB_RMI_L2_CACHE_CONTROL),
                   S_02807C_Z_WR_POLICY(zs_write_policy) |
                   S_02807C_S_WR_POLICY(zs_write_policy) |
                   S_02807C_HTILE_WR_POLICY(meta_write_policy) |
@@ -478,7 +493,15 @@ gfx10_init_graphics_preamble_state(const struct ac_preamble_state *state,
                   S_028830_SMALL_PRIM_FILTER_ENABLE(1));
 
    ac_pm4_set_reg(pm4, R_028A18_VGT_HOS_MAX_TESS_LEVEL, fui(64));
-   ac_pm4_set_reg(pm4, R_028AAC_VGT_ESGS_RING_ITEMSIZE, 1);
+
+   /*
+    * MGFX2 maps VGT_ESGS_RING_ITEMSIZE to 0x028b40, not 0x028aac.
+    * Don't emit a guessed replacement here yet. The shader-derived
+    * value is diagnosed in the RADV NGG path below.
+    */
+   if (!info->is_xclipse940)
+      ac_pm4_set_reg(pm4, R_028AAC_VGT_ESGS_RING_ITEMSIZE, 1);
+
    ac_pm4_set_reg(pm4, R_028B50_VGT_TESS_DISTRIBUTION,
                   info->gfx_level >= GFX11 ?
                      S_028B50_ACCUM_ISOLINE(128) |
@@ -512,10 +535,34 @@ gfx10_init_graphics_preamble_state(const struct ac_preamble_state *state,
     * the size of the PC minus the largest possible allocation for
     * a single primitive shader subgroup.
     */
+   /* Compare the Xclipse 940 graphics preamble with the vendor driver one
+    * register at a time.  The stock submit programs 0x100 here; the RADV
+    * GFX10.3 default is 0x200.  Keep the experiment opt-in.
+    */
+   const bool x940_deallocs_256 =
+      info->is_xclipse940 && getenv("RADV_X940_DIAG_NGG_MAX_DEALLOCS_256");
+   const unsigned max_deallocs =
+      x940_deallocs_256 ? 256 : (info->gfx_level >= GFX11 ? 16 : 512);
+   if (x940_deallocs_256)
+      fprintf(stderr, "x940-ngg-max-deallocs: PA_SC_NGG_MODE_CNTL=0x%08x\n",
+              S_028C50_MAX_DEALLOCS_IN_WAVE(max_deallocs));
    ac_pm4_set_reg(pm4, R_028C50_PA_SC_NGG_MODE_CNTL,
-                  S_028C50_MAX_DEALLOCS_IN_WAVE(info->gfx_level >= GFX11 ? 16 : 512));
-   if (info->gfx_level < GFX11)
+                  S_028C50_MAX_DEALLOCS_IN_WAVE(max_deallocs));
+   if (info->is_xclipse940) {
+      /*
+       * On MGFX2 0x028c58 is PA_SC_SHADER_CONTROL, not
+       * VGT_VERTEX_REUSE_BLOCK_CNTL. Samsung stock initializes it to 0
+       * for the probe pipeline.
+       */
+      ac_pm4_set_reg(pm4, 0x028c58, 0);
+
+      if (getenv("RADV_X940_DIAG_GFX_INIT_MAP"))
+         fprintf(stderr,
+                 "x940-gfx-init-map: skip b324; skip legacy 028aac; "
+                 "PA_SC_SHADER_CONTROL[028c58]=0\n");
+   } else if (info->gfx_level < GFX11) {
       ac_pm4_set_reg(pm4, R_028C58_VGT_VERTEX_REUSE_BLOCK_CNTL, 14); /* Reuse for legacy (non-NGG) only. */
+   }
 
    /* Uconfig registers. */
    ac_pm4_set_reg(pm4, R_030924_GE_MIN_VTX_INDX, 0);
@@ -530,7 +577,7 @@ gfx10_init_graphics_preamble_state(const struct ac_preamble_state *state,
    ac_pm4_set_reg(pm4, R_030964_GE_MAX_VTX_INDX, ~0);
    ac_pm4_set_reg(pm4, R_030968_VGT_INSTANCE_BASE_ID, 0);
    ac_pm4_set_reg(pm4, R_03097C_GE_STEREO_CNTL, 0);
-   ac_pm4_set_reg(pm4, R_030988_GE_USER_VGPR_EN, 0);
+   ac_pm4_set_reg(pm4, ac_x940_reg_v25(info->is_xclipse940, R_030988_GE_USER_VGPR_EN, AC_X940_GE_USER_VGPR_EN), 0);
 
    ac_pm4_set_reg(pm4, R_030A00_PA_SU_LINE_STIPPLE_VALUE, 0);
    ac_pm4_set_reg(pm4, R_030A04_PA_SC_LINE_STIPPLE_STATE, 0);
@@ -597,7 +644,7 @@ gfx12_init_graphics_preamble_state(const struct ac_preamble_state *state,
    /* Shader registers - HS */
    ac_pm4_set_reg(pm4, R_00B418_SPI_SHADER_PGM_HI_LS,
                   S_00B524_MEM_BASE(info->address32_hi >> 8));
-   ac_pm4_set_reg_idx3(pm4, R_00B41C_SPI_SHADER_PGM_RSRC3_HS,
+   ac_pm4_set_reg_idx3(pm4, ac_x940_reg_v25(info->is_xclipse940, R_00B41C_SPI_SHADER_PGM_RSRC3_HS, AC_X940_SPI_SHADER_PGM_RSRC3_HS),
                        ac_apply_cu_en(0xffffffff, 0, 0, info));
    ac_pm4_set_reg(pm4, R_00B4C8_SPI_SHADER_USER_ACCUM_LSHS_0, 0);
    ac_pm4_set_reg(pm4, R_00B4CC_SPI_SHADER_USER_ACCUM_LSHS_1, 0);
