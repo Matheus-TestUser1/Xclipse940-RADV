@@ -63,7 +63,7 @@ typedef void *drmDevicePtr;
 #include "winsys/null/radv_null_winsys_public.h"
 #include "git_sha1.h"
 #include "sid.h"
-#include "ac_x940_reg_v25.h"
+#include "ac_mgfx2_regs.h"
 #include "vk_common_entrypoints.h"
 #include "vk_format.h"
 #include "vk_sync.h"
@@ -894,7 +894,9 @@ radv_create_gfx_preamble(struct radv_device *device)
 
    radeon_check_space(device->ws, cs, 512);
 
-   radv_emit_graphics(device, cs);
+   VkResult result = radv_emit_graphics(device, cs);
+   if (result != VK_SUCCESS)
+      goto fail;
 
    device->ws->cs_pad(cs, 0);
 
@@ -909,7 +911,7 @@ radv_create_gfx_preamble(struct radv_device *device)
       fprintf(stderr, "x940-gfx-preamble: end\n");
    }
 
-   VkResult result = radv_bo_create(
+   result = radv_bo_create(
       device, NULL, cs->cdw * 4, 4096, device->ws->cs_domain(device->ws),
       RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_READ_ONLY | RADEON_FLAG_GTT_WC,
       RADV_BO_PRIORITY_CS, 0, true, &device->gfx_init);
@@ -1035,7 +1037,8 @@ radv_emit_default_sample_locations(const struct radv_physical_device *pdev, stru
    if (pdev->info.gfx_level >= GFX12) {
       radeon_set_context_reg_seq(cs, R_028BF0_PA_SC_CENTROID_PRIORITY_0, 2);
    } else {
-      radeon_set_context_reg_seq(cs, ac_x940_reg_v25(pdev->info.is_xclipse940, R_028BD4_PA_SC_CENTROID_PRIORITY_0, AC_X940_PA_SC_CENTROID_PRIORITY_0), 2);
+      radeon_set_context_reg_seq(cs, ac_mgfx2_reg(pdev->info.is_xclipse940, R_028BD4_PA_SC_CENTROID_PRIORITY_0,
+                                                AC_MGFX2_PA_SC_CENTROID_PRIORITY_0), 2);
    }
    radeon_emit(cs, centroid_priority);
    radeon_emit(cs, centroid_priority >> 32);

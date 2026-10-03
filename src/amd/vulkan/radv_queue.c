@@ -12,7 +12,7 @@
 #include "radv_buffer.h"
 #include "radv_cp_reg_shadowing.h"
 #include "radv_cs.h"
-#include "ac_x940_reg_v25.h"
+#include "ac_mgfx2_regs.h"
 #include "radv_debug.h"
 #include "radv_device_memory.h"
 #include "radv_image.h"
@@ -411,7 +411,10 @@ radv_emit_tess_factor_ring(struct radv_device *device, struct radeon_cmdbuf *cs,
       if (pdev->info.gfx_level >= GFX12) {
          radeon_set_uconfig_reg(cs, R_03099C_VGT_TF_MEMORY_BASE_HI, S_030984_BASE_HI(tf_va >> 40));
       } else if (pdev->info.gfx_level >= GFX10) {
-         radeon_set_uconfig_reg(cs, R_030984_VGT_TF_MEMORY_BASE_HI, S_030984_BASE_HI(tf_va >> 40));
+         radeon_set_uconfig_reg(cs,
+                                ac_mgfx2_reg(pdev->info.is_xclipse940,
+                                                R_030984_VGT_TF_MEMORY_BASE_HI, AC_MGFX2_VGT_TF_MEMORY_BASE_HI),
+                                S_030984_BASE_HI(tf_va >> 40));
       } else if (pdev->info.gfx_level == GFX9) {
          radeon_set_uconfig_reg(cs, R_030944_VGT_TF_MEMORY_BASE_HI, S_030944_BASE_HI(tf_va >> 40));
       }
@@ -572,43 +575,48 @@ radv_emit_graphics_shader_pointers(struct radv_device *device, struct radeon_cmd
 
    radv_cs_add_buffer(device->ws, cs, descriptor_bo);
 
-   if (pdev->info.gfx_level >= GFX12) {
-      uint32_t regs[] = {R_00B030_SPI_SHADER_USER_DATA_PS_0, R_00B410_SPI_SHADER_PGM_LO_HS,
-                         R_00B210_SPI_SHADER_PGM_LO_GS};
+   static const uint32_t mgfx2_regs[] = {
+      AC_MGFX2_SPI_SHADER_USER_DATA_PS_0,
+      AC_MGFX2_SPI_SHADER_USER_DATA_ADDR_LO_GS,
+      AC_MGFX2_SPI_SHADER_USER_DATA_ADDR_LO_HS,
+   };
+   static const uint32_t gfx12_regs[] = {
+      R_00B030_SPI_SHADER_USER_DATA_PS_0, R_00B410_SPI_SHADER_PGM_LO_HS, R_00B210_SPI_SHADER_PGM_LO_GS,
+   };
+   static const uint32_t gfx11_regs[] = {
+      R_00B030_SPI_SHADER_USER_DATA_PS_0, R_00B420_SPI_SHADER_PGM_LO_HS, R_00B220_SPI_SHADER_PGM_LO_GS,
+   };
+   static const uint32_t gfx9_regs[] = {
+      R_00B030_SPI_SHADER_USER_DATA_PS_0, R_00B130_SPI_SHADER_USER_DATA_VS_0,
+      R_00B208_SPI_SHADER_USER_DATA_ADDR_LO_GS, R_00B408_SPI_SHADER_USER_DATA_ADDR_LO_HS,
+   };
+   static const uint32_t legacy_regs[] = {
+      R_00B030_SPI_SHADER_USER_DATA_PS_0, R_00B130_SPI_SHADER_USER_DATA_VS_0,
+      R_00B230_SPI_SHADER_USER_DATA_GS_0, R_00B330_SPI_SHADER_USER_DATA_ES_0,
+      R_00B430_SPI_SHADER_USER_DATA_HS_0, R_00B530_SPI_SHADER_USER_DATA_LS_0,
+   };
+   const uint32_t *regs;
+   unsigned count;
 
-      for (int i = 0; i < ARRAY_SIZE(regs); ++i) {
-         radv_emit_shader_pointer(device, cs, regs[i], va, true);
-      }
+   if (pdev->info.is_xclipse940) {
+      regs = mgfx2_regs;
+      count = ARRAY_SIZE(mgfx2_regs);
+   } else if (pdev->info.gfx_level >= GFX12) {
+      regs = gfx12_regs;
+      count = ARRAY_SIZE(gfx12_regs);
    } else if (pdev->info.gfx_level >= GFX11) {
-      uint32_t regs[] = {R_00B030_SPI_SHADER_USER_DATA_PS_0, R_00B420_SPI_SHADER_PGM_LO_HS,
-                         R_00B220_SPI_SHADER_PGM_LO_GS};
-
-      for (int i = 0; i < ARRAY_SIZE(regs); ++i) {
-         radv_emit_shader_pointer(device, cs, regs[i], va, true);
-      }
-   } else if (pdev->info.gfx_level >= GFX10) {
-      uint32_t regs[] = {R_00B030_SPI_SHADER_USER_DATA_PS_0, R_00B130_SPI_SHADER_USER_DATA_VS_0,
-                         R_00B208_SPI_SHADER_USER_DATA_ADDR_LO_GS, R_00B408_SPI_SHADER_USER_DATA_ADDR_LO_HS};
-
-      for (int i = 0; i < ARRAY_SIZE(regs); ++i) {
-         radv_emit_shader_pointer(device, cs, regs[i], va, true);
-      }
-   } else if (pdev->info.gfx_level == GFX9) {
-      uint32_t regs[] = {R_00B030_SPI_SHADER_USER_DATA_PS_0, R_00B130_SPI_SHADER_USER_DATA_VS_0,
-                         R_00B208_SPI_SHADER_USER_DATA_ADDR_LO_GS, R_00B408_SPI_SHADER_USER_DATA_ADDR_LO_HS};
-
-      for (int i = 0; i < ARRAY_SIZE(regs); ++i) {
-         radv_emit_shader_pointer(device, cs, regs[i], va, true);
-      }
+      regs = gfx11_regs;
+      count = ARRAY_SIZE(gfx11_regs);
+   } else if (pdev->info.gfx_level >= GFX9) {
+      regs = gfx9_regs;
+      count = ARRAY_SIZE(gfx9_regs);
    } else {
-      uint32_t regs[] = {R_00B030_SPI_SHADER_USER_DATA_PS_0, R_00B130_SPI_SHADER_USER_DATA_VS_0,
-                         R_00B230_SPI_SHADER_USER_DATA_GS_0, R_00B330_SPI_SHADER_USER_DATA_ES_0,
-                         R_00B430_SPI_SHADER_USER_DATA_HS_0, R_00B530_SPI_SHADER_USER_DATA_LS_0};
-
-      for (int i = 0; i < ARRAY_SIZE(regs); ++i) {
-         radv_emit_shader_pointer(device, cs, regs[i], va, true);
-      }
+      regs = legacy_regs;
+      count = ARRAY_SIZE(legacy_regs);
    }
+
+   for (unsigned i = 0; i < count; ++i)
+      radv_emit_shader_pointer(device, cs, regs[i], va, true);
 }
 
 static void
@@ -677,7 +685,7 @@ radv_emit_attribute_ring(struct radv_device *device, struct radeon_cmdbuf *cs, s
    }
 }
 
-static void
+static VkResult
 radv_emit_compute(struct radv_device *device, struct radeon_cmdbuf *cs, bool is_compute_queue)
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
@@ -685,7 +693,7 @@ radv_emit_compute(struct radv_device *device, struct radeon_cmdbuf *cs, bool is_
 
    struct ac_pm4_state *pm4 = ac_pm4_create_sized(&pdev->info, false, 64, is_compute_queue);
    if (!pm4)
-      return;
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
 
    const struct ac_preamble_state preamble_state = {
       .border_color_va = border_color_va,
@@ -718,6 +726,7 @@ radv_emit_compute(struct radv_device *device, struct radeon_cmdbuf *cs, bool is_
    radeon_emit_array(cs, pm4->pm4, pm4->ndw);
 
    ac_pm4_free_state(pm4);
+   return VK_SUCCESS;
 }
 
 /* 12.4 fixed-point */
@@ -727,7 +736,7 @@ radv_pack_float_12p4(float x)
    return x <= 0 ? 0 : x >= 4096 ? 0xffff : x * 16;
 }
 
-void
+VkResult
 radv_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
 {
    struct radv_physical_device *pdev = radv_device_physical(device);
@@ -750,7 +759,7 @@ radv_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
 
    struct ac_pm4_state *pm4 = ac_pm4_create_sized(&pdev->info, false, 512, false);
    if (!pm4)
-      return;
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
 
    const struct ac_preamble_state preamble_state = {
       .border_color_va = border_color_va,
@@ -760,8 +769,13 @@ radv_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
 
    if (!has_clear_state) {
       for (i = 0; i < 16; i++) {
-         radeon_set_context_reg(cs, R_0282D0_PA_SC_VPORT_ZMIN_0 + i * 8, 0);
-         radeon_set_context_reg(cs, R_0282D4_PA_SC_VPORT_ZMAX_0 + i * 8, fui(1.0));
+         const unsigned stride = pdev->info.is_xclipse940 ? 0x20 : 8;
+         radeon_set_context_reg(cs,
+                               ac_mgfx2_reg(pdev->info.is_xclipse940, R_0282D0_PA_SC_VPORT_ZMIN_0,
+                                            AC_MGFX2_PA_SC_VPORT_ZMIN_0) + i * stride, 0);
+         radeon_set_context_reg(cs,
+                               ac_mgfx2_reg(pdev->info.is_xclipse940, R_0282D4_PA_SC_VPORT_ZMAX_0,
+                                            AC_MGFX2_PA_SC_VPORT_ZMAX_0) + i * stride, fui(1.0));
       }
    }
 
@@ -774,7 +788,8 @@ radv_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
    if (pdev->info.gfx_level <= GFX8)
       radeon_set_sh_reg(cs, R_00B324_SPI_SHADER_PGM_HI_ES, S_00B324_MEM_BASE(pdev->info.address32_hi >> 8));
 
-   if (pdev->info.gfx_level < GFX11)
+   /* The MGFX2 header has no SPI_SHADER_PGM_HI_VS register. */
+   if (pdev->info.gfx_level < GFX11 && !pdev->info.is_xclipse940)
       radeon_set_sh_reg(cs, R_00B124_SPI_SHADER_PGM_HI_VS, S_00B124_MEM_BASE(pdev->info.address32_hi >> 8));
 
    unsigned cu_mask_ps = pdev->info.gfx_level >= GFX10_3 ? ac_gfx103_get_cu_mask_ps(&pdev->info) : ~0u;
@@ -869,7 +884,7 @@ radv_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
                                 S_0286D4_PNT_SPRITE_OVRD_W(V_0286D4_SPI_PNT_SPRITE_SEL_1) |
                                 S_0286D4_PNT_SPRITE_TOP_1(0)); /* vulkan is top to bottom - 1.0 at bottom */
    } else {
-      radeon_set_context_reg(cs, ac_x940_reg_v25(pdev->info.is_xclipse940, R_0286D4_SPI_INTERP_CONTROL_0, AC_X940_SPI_INTERP_CONTROL_0),
+      radeon_set_context_reg(cs, ac_mgfx2_reg(pdev->info.is_xclipse940, R_0286D4_SPI_INTERP_CONTROL_0, AC_MGFX2_SPI_INTERP_CONTROL_0),
                              S_0286D4_FLAT_SHADE_ENA(1) | S_0286D4_PNT_SPRITE_ENA(1) |
                                 S_0286D4_PNT_SPRITE_OVRD_X(V_0286D4_SPI_PNT_SPRITE_SEL_S) |
                                 S_0286D4_PNT_SPRITE_OVRD_Y(V_0286D4_SPI_PNT_SPRITE_SEL_T) |
@@ -922,10 +937,10 @@ radv_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
    radeon_emit_array(cs, pm4->pm4, pm4->ndw);
    ac_pm4_free_state(pm4);
 
-   radv_emit_compute(device, cs, false);
+   return radv_emit_compute(device, cs, false);
 }
 
-static void
+static VkResult
 radv_init_graphics_state(struct radeon_cmdbuf *cs, struct radv_device *device)
 {
    if (device->gfx_init) {
@@ -935,8 +950,9 @@ radv_init_graphics_state(struct radeon_cmdbuf *cs, struct radv_device *device)
 
       radv_cs_add_buffer(device->ws, cs, device->gfx_init);
    } else {
-      radv_emit_graphics(device, cs);
+      return radv_emit_graphics(device, cs);
    }
+   return VK_SUCCESS;
 }
 
 static VkResult
@@ -956,9 +972,20 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
    struct radeon_winsys_bo *attr_ring_bo = queue->attr_ring_bo;
    struct radeon_winsys_bo *gds_bo = queue->gds_bo;
    struct radeon_winsys_bo *gds_oa_bo = queue->gds_oa_bo;
+   bool new_gds_resident = false;
+   bool new_gds_oa_resident = false;
    struct radeon_cmdbuf *dest_cs[3] = {0};
    const uint32_t ring_bo_flags = RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING;
    VkResult result = VK_SUCCESS;
+
+   /* The MGFX2 header defines neither ESGS nor GSVS ring-size registers.
+    * The AMD packet starts at 0x030900 and would overwrite MGFX2
+    * VGT_GS_OUT_PRIM_TYPE at 0x030904. Reject this path before submit.
+    */
+   if (pdev->info.is_xclipse940 && (needs->esgs_ring_size || needs->gsvs_ring_size)) {
+      fprintf(stderr, "x940-unsupported-gs-ring: no verified MGFX2 ring-size register\n");
+      return vk_error(queue, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
 
    const bool add_sample_positions = !queue->ring_info.sample_positions && needs->sample_positions;
    const uint32_t scratch_size = needs->scratch_size_per_wave * needs->scratch_waves;
@@ -1067,6 +1094,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
       result = device->ws->buffer_make_resident(ws, gds_bo, true);
       if (result != VK_SUCCESS)
          goto fail;
+      new_gds_resident = true;
    }
 
    if (!queue->ring_info.gds_oa && needs->gds_oa) {
@@ -1083,6 +1111,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
       result = device->ws->buffer_make_resident(ws, gds_oa_bo, true);
       if (result != VK_SUCCESS)
          goto fail;
+      new_gds_oa_resident = true;
    }
 
    /* Re-initialize the descriptor BO when any ring BOs changed.
@@ -1139,7 +1168,9 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
       case RADV_QUEUE_GENERAL:
          if (queue->uses_shadow_regs)
             radv_emit_shadow_regs_preamble(cs, device, queue);
-         radv_init_graphics_state(cs, device);
+         result = radv_init_graphics_state(cs, device);
+         if (result != VK_SUCCESS)
+            goto fail;
 
          if (esgs_ring_bo || gsvs_ring_bo || tess_rings_bo || task_rings_bo) {
             radeon_emit(cs, PKT3(PKT3_EVENT_WRITE, 0, 0));
@@ -1159,7 +1190,9 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
          radv_emit_graphics_scratch(device, cs, needs->scratch_size_per_wave, needs->scratch_waves, scratch_bo);
          break;
       case RADV_QUEUE_COMPUTE:
-         radv_emit_compute(device, cs, true);
+         result = radv_emit_compute(device, cs, true);
+         if (result != VK_SUCCESS)
+            goto fail;
 
          if (task_rings_bo) {
             radeon_emit(cs, PKT3(PKT3_EVENT_WRITE, 0, 0));
@@ -1277,11 +1310,13 @@ fail:
    if (attr_ring_bo && attr_ring_bo != queue->attr_ring_bo)
       radv_bo_destroy(device, NULL, attr_ring_bo);
    if (gds_bo && gds_bo != queue->gds_bo) {
-      ws->buffer_make_resident(ws, queue->gds_bo, false);
+      if (new_gds_resident)
+         ws->buffer_make_resident(ws, gds_bo, false);
       radv_bo_destroy(device, NULL, gds_bo);
    }
    if (gds_oa_bo && gds_oa_bo != queue->gds_oa_bo) {
-      ws->buffer_make_resident(ws, queue->gds_oa_bo, false);
+      if (new_gds_oa_resident)
+         ws->buffer_make_resident(ws, gds_oa_bo, false);
       radv_bo_destroy(device, NULL, gds_oa_bo);
    }
 

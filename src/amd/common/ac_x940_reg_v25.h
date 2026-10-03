@@ -1,32 +1,36 @@
 /* SPDX-License-Identifier: MIT
- * Physical MGFX2 addresses, checked against Samsung gc_10_4_0_offset_m2.h.
- * Use only at a named AMD register call site. Already-physical literals are
- * deliberately not translated: several addresses alias other AMD registers.
+ * Compatibility names for existing X940 bring-up patches.
+ * New code should include ac_mgfx2_regs.h and use its named register enum.
  */
 #ifndef AC_X940_REG_V25_H
 #define AC_X940_REG_V25_H
-#include <stdbool.h>
+
+#include "ac_mgfx2_regs.h"
+
 static inline unsigned
 ac_x940_reg_v25(bool is_xclipse940, unsigned amd_reg, unsigned mgfx2_reg)
 {
-   return is_xclipse940 ? mgfx2_reg : amd_reg;
+   return ac_mgfx2_reg(is_xclipse940, amd_reg, (enum ac_mgfx2_reg)mgfx2_reg);
 }
-#define AC_X940_CB_COLOR0_INFO 0x028d80u
-#define AC_X940_CB_SHADER_MASK 0x028decu
-#define AC_X940_DB_EQAA 0x02806cu
-#define AC_X940_DB_RENDER_CONTROL 0x028064u
-#define AC_X940_DB_RENDER_OVERRIDE2 0x02805cu
-#define AC_X940_DB_RMI_L2_CACHE_CONTROL 0x028068u
-#define AC_X940_DB_VRS_OVERRIDE_CNTL 0x028000u
-#define AC_X940_GE_USER_VGPR_EN 0x030984u
-#define AC_X940_PA_SC_CENTROID_PRIORITY_0 0x028bf0u
-#define AC_X940_PA_SC_MODE_CNTL_0 0x028c40u
-#define AC_X940_SPI_BARYC_CNTL 0x028658u
-#define AC_X940_SPI_INTERP_CONTROL_0 0x028644u
-#define AC_X940_SPI_SHADER_COL_FORMAT 0x028654u
-#define AC_X940_SPI_SHADER_PGM_HI_LS 0x00b41cu
-#define AC_X940_SPI_SHADER_PGM_RSRC3_HS 0x00b428u
-#define AC_X940_SPI_SHADER_PGM_RSRC3_PS 0x00b000u
-#define AC_X940_SPI_SHADER_PGM_RSRC4_HS 0x00b42cu
-#define AC_X940_VGT_REUSE_OFF 0x028a9cu
+
+#define AC_X940_CB_COLOR0_INFO AC_MGFX2_CB_COLOR0_INFO
+#define AC_X940_CB_SHADER_MASK AC_MGFX2_CB_SHADER_MASK
+#define AC_X940_DB_EQAA AC_MGFX2_DB_EQAA
+#define AC_X940_DB_RENDER_CONTROL AC_MGFX2_DB_RENDER_CONTROL
+#define AC_X940_DB_RENDER_OVERRIDE2 AC_MGFX2_DB_RENDER_OVERRIDE2
+#define AC_X940_DB_RMI_L2_CACHE_CONTROL AC_MGFX2_DB_RMI_L2_CACHE_CONTROL
+#define AC_X940_DB_VRS_OVERRIDE_CNTL AC_MGFX2_DB_VRS_OVERRIDE_CNTL
+#define AC_X940_GE_USER_VGPR_EN AC_MGFX2_GE_USER_VGPR_EN
+#define AC_X940_PA_SC_CENTROID_PRIORITY_0 AC_MGFX2_PA_SC_CENTROID_PRIORITY_0
+#define AC_X940_PA_SC_MODE_CNTL_0 AC_MGFX2_PA_SC_MODE_CNTL_0
+#define AC_X940_SPI_BARYC_CNTL AC_MGFX2_SPI_BARYC_CNTL
+#define AC_X940_SPI_INTERP_CONTROL_0 AC_MGFX2_SPI_INTERP_CONTROL_0
+#define AC_X940_SPI_SHADER_COL_FORMAT AC_MGFX2_SPI_SHADER_COL_FORMAT
+#define AC_X940_SPI_SHADER_PGM_HI_LS AC_MGFX2_SPI_SHADER_PGM_HI_LS
+#define AC_X940_SPI_SHADER_PGM_RSRC3_HS AC_MGFX2_SPI_SHADER_PGM_RSRC3_HS
+#define AC_X940_SPI_SHADER_PGM_RSRC3_PS AC_MGFX2_SPI_SHADER_PGM_RSRC3_PS
+#define AC_X940_SPI_SHADER_PGM_RSRC4_HS AC_MGFX2_SPI_SHADER_PGM_RSRC4_HS
+#define AC_X940_VGT_REUSE_OFF AC_MGFX2_VGT_REUSE_OFF
+#define AC_X940_VGT_TF_MEMORY_BASE_HI AC_MGFX2_VGT_TF_MEMORY_BASE_HI
+
 #endif

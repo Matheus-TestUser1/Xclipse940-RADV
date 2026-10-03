@@ -1,0 +1,132 @@
+# MGFX2 register emission audit
+
+## Source and limits
+
+This refactor was prepared against public `main` at
+`75db695acee70d0c4a4fa8228c2a323919c2a548` on 2026-10-03. Its driver sources
+still contain the V25 bring-up changes. The device owner's V26–V36 changes
+are newer than this public snapshot. This patch must be reconciled with those
+sources before deployment; replacing the owner's files with this snapshot
+would lose later framebuffer, CU-mask and diagnostic work.
+
+The hardware references are Samsung's `gc_10_4_0_offset_m2.h`,
+`gc_10_4_0_sh_mask_m2.h` and `vangogh_lite_ip_offset.h`. Addresses are derived
+as `(GC_BASE__INST0_SEG[BASE_IDX] + mmREGISTER) * 4`. Comparing a DWORD offset
+directly with a PM4 byte address gives an invalid result.
+
+The audit examines AMD C, C++ and header files. A textual mismatch is a review
+candidate: a GFX6/GFX9/GFX12 branch may never execute on X940. Absence of a
+name in the header is not, by itself, proof that a register cannot exist.
+The port avoids the unverified legacy VS path and legacy GS ring-size writes.
+
+## Confirmed issues and changes
+
+| Writer / role | AMD layout used before | MGFX2 layout used now |
+| --- | --- | --- |
+| NGG program metadata, including separately compiled shaders | LO `0x00b320`, RSRC1/2 `0x00b228/0x00b22c` | ES LO/HI `0x00b218/0x00b21c`, GS RSRC1/2 `0x00b210/0x00b214` |
+| Hull program metadata | LS LO `0x00b520`, HS RSRC1/2 `0x00b428/0x00b42c` | LS LO/HI `0x00b418/0x00b41c`, HS RSRC1/2 `0x00b410/0x00b414` |
+| Tessellation factor address high | `0x030984`, aliases MGFX2 `GE_USER_VGPR_EN` | `0x030988` |
+| Viewport transforms and depth ranges | Six transform values from `0x02843c`; separate Z array at `0x0282d0` | Eight values per viewport from `0x028444`, stride `0x20`; ZMIN/ZMAX at `0x02845c/0x028460` |
+| Pixel shader input array | `0x028644` | `0x028664`, including its consecutive input range |
+| Pixel shader input enable/address | `0x0286cc/0x0286d0` | `0x02865c/0x028660` |
+| Pixel shader input control | `0x0286d8` | `0x028710` |
+| Shader Z export format, including epilogs | `0x028710`, aliases MGFX2 input control | `0x028650` |
+| Pixel shader control | `0x028c40`, aliases MGFX2 raster mode control | `0x028c58` |
+| Clip and raster mode control | Correct mapping depended on a diagnostic environment variable | Always map X940 to `0x028814/0x028810` |
+| Guardband packet | Four values from `0x028be8` | Four values from `0x028434` |
+| Render target write mask | `0x028238` | `0x028de8` |
+| Conservative rasterization control | `0x028c4c` | `0x028c54` |
+| Tessellation parameter control | `0x028b6c` | `0x028aa8` |
+| Alpha to coverage control | `0x028b70`, with AMD dithering fields | `0x028070`; retain only MGFX2's defined enable bit |
+| Stencil operation control | `0x02842c` | `0x028804` |
+| Front/back stencil reference and masks | `0x028430/0x028434` | `0x0283e8/0x0283ec` |
+
+Additional structural changes:
+
+- Introduce `ac_mgfx2_regs.h`: an unversioned, named layout shared by writers
+  and shader metadata. Keep `ac_x940_reg_v25.h` as a forwarding compatibility
+  header for later local bring-up patches.
+- Skip legacy VS initialization on X940, retaining PS/HS setup. Keep NGG
+  enabled on X940 so `RADV_DEBUG=nongg` cannot select the unverified VS block.
+- Initialize ES program address high in the preamble. Separately compiled
+  shaders and prologs write LO through metadata and depend on that setup.
+- Select the descriptor pointer table once by hardware. X940 uses PS, GS and
+  HS; omit legacy VS. Those three addresses already matched Samsung, so their
+  alleged offset discrepancy was not confirmed.
+- Reject legacy ESGS/GSVS ring-size requests before submission. The generic
+  two-register packet at `0x030900` also writes `0x030904`, MGFX2's
+  `VGT_GS_OUT_PRIM_TYPE`. This is a feature restriction until the ring protocol
+  is verified, not an implementation of legacy GS support.
+- Correct GDS/OA cleanup to unresident the newly allocated BO, rather than
+  the old queue BO. Track successful residency so a failed residency call
+  does not trigger an unmatched removal.
+- Return and propagate preamble allocation failures. Discard the failed CS
+  instead of publishing a preamble with missing initialization.
+- Stop advertising fragment shader interlock on X940: the required
+  `PA_SC_SHADER_CONTROL.LOAD_COLLISION_WAVEID` bit is reserved in MGFX2's
+  header. Its protocol needs separate implementation and validation.
+
+## Validation performed
+
+`bin/x940_regmap_audit.py` verifies all 68 named addresses in the new layout
+against the kernel headers and records other source references for review.
+On this snapshot it scans 463 files and derives 3,752 named GC registers.
+Its candidate counts do **not** count confirmed runtime bugs.
+
+`bin/x940_validate_emitters.py` compiles actual common preamble/PM4 source
+and extracts selected RADV functions unchanged into a host harness. Small
+dependency mocks capture their writes. Checks cover:
+
+- Ten common AMD preamble cases, GFX10 through GFX12 with cache policy on/off:
+  byte-identical to the baseline.
+- MGFX2 preamble: no legacy VS writes; PS/HS retained; correct ES high address.
+- Descriptor pointers and merged/separately compiled NGG and hull metadata.
+- Fragment writes, viewport counts 1–16, guardband, conservative rasterization
+  and alpha to coverage; non-X940 output matches the baseline.
+- Fifty-seven retained field macros, testing each input bit against Samsung
+  masks and shifts. GFX11-only `PRIM_ATTR` is excluded from MGFX2 validation.
+- Compute preamble allocation failure returns an error without emitting data.
+- The actual preamble failure cleanup block: only newly resident GDS/OA BOs
+  are unresidented; old queue BOs are preserved.
+
+This is host validation of emission and cleanup. The complete Android driver
+has **not** been built in this environment, and no GPU submission was made.
+It does not demonstrate that the intermittent hang is fixed.
+
+Example, with the Samsung headers available locally:
+
+```sh
+python3 -B bin/x940_regmap_audit.py \
+  --offset-header "$OFFSET_HEADER" --ip-header "$IP_HEADER" \
+  --output "$HOME/xclipse-diag/mgfx2-audit.json"
+
+python3 -B bin/x940_validate_emitters.py \
+  --offset-header "$OFFSET_HEADER" --ip-header "$IP_HEADER" \
+  --mask-header "$MASK_HEADER"
+```
+
+## Remaining work before GPU tests
+
+1. Merge with the owner's current sources. Preserve the V26 context-default
+   diagnostic, V27 CU-mask work, V29 framebuffer layout and later diagnostics.
+   Public V25 still has CB/DB framebuffer ranges that later local patches
+   corrected; this patch does not reproduce that missing framebuffer port.
+2. Build the full Android driver. Record the library hash used on the device.
+3. Record command buffers without submission for the existing zero-draw and
+   0/1/2/3-vertex cases. Decode the full preamble and main IB; review the
+   intentional changes rather than requiring equality to an obsolete capture.
+4. Run controlled execution with external GPU counters and the existing
+   lifecycle log. Check completion, delayed resets and teardown separately.
+   Stop the series on a counter increase or failed fence and capture bugreport.
+5. Audit remaining enabled features by their actual MGFX2 path: framebuffer
+   and fast clear, queries/streamout, tessellation, scratch, shader resources,
+   context restoration and queue synchronization. A matching address alone
+   does not validate fields, range strides, shader ABI or packet semantics.
+
+`SPI_BUSY` and an incomplete primitive threshold help narrow the investigation.
+They do not prove that a one-vertex draw never launches a shader, that userdata
+is the cause, or that the process named in a later reset caused the original
+fault. Early fence signaling and leaked global state remain hypotheses until
+the KMD protocol and captured event order establish them. No change here
+forces all CU mask bits, kills Android graphics services or adds a blind
+register-status polling wait.
