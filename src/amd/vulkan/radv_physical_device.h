@@ -229,7 +229,8 @@ radv_has_shader_buffer_float_minmax(const struct radv_physical_device *pdev, uns
 static inline bool
 radv_has_pops(const struct radv_physical_device *pdev)
 {
-   return pdev->info.gfx_level >= GFX9 && !pdev->use_llvm;
+   /* MGFX2 marks PA_SC_SHADER_CONTROL.LOAD_COLLISION_WAVEID as reserved. */
+   return !pdev->info.is_xclipse940 && pdev->info.gfx_level >= GFX9 && !pdev->use_llvm;
 }
 
 static inline bool

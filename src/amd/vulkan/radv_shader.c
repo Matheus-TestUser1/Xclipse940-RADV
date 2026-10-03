@@ -9,6 +9,7 @@
  */
 
 #include "radv_shader.h"
+#include "ac_mgfx2_regs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include "meta/radv_meta.h"
@@ -1906,6 +1907,15 @@ radv_precompute_registers_pgm(const struct radv_device *device, struct radv_shad
    default:
       unreachable("invalid hw stage");
       break;
+   }
+
+   if (pdev->info.is_xclipse940 &&
+       (hw_stage == AC_HW_NEXT_GEN_GEOMETRY_SHADER || hw_stage == AC_HW_HULL_SHADER)) {
+      const struct ac_mgfx2_pgm_regs regs = ac_mgfx2_shader_pgm_regs(
+         hw_stage == AC_HW_HULL_SHADER ? AC_MGFX2_SHADER_HULL : AC_MGFX2_SHADER_NGG);
+      info->regs.pgm_lo = regs.lo;
+      info->regs.pgm_rsrc1 = regs.rsrc1;
+      info->regs.pgm_rsrc2 = regs.rsrc2;
    }
 }
 

@@ -2221,7 +2221,9 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
 
    pdev->use_fmask = pdev->info.gfx_level < GFX11 && !(instance->debug_flags & RADV_DEBUG_NO_FMASK);
 
-   pdev->use_ngg = (pdev->info.gfx_level >= GFX10 && pdev->info.family != CHIP_NAVI14 &&
+   /* MGFX2 uses the mapped NGG path; the AMD legacy VS registers are undefined. */
+   pdev->use_ngg = pdev->info.is_xclipse940 ||
+                   (pdev->info.gfx_level >= GFX10 && pdev->info.family != CHIP_NAVI14 &&
                     !(instance->debug_flags & RADV_DEBUG_NO_NGG)) ||
                    pdev->info.gfx_level >= GFX11;
 
