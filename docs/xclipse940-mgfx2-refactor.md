@@ -7,8 +7,10 @@ The initial refactor used public `main` at
 owner's source archive `x940-projeto-fontes-20261003-213344.tar.xz`
 (SHA256 `4fb8cff4814709db37f9ad4243111fe74511c2991caf4e17ee4253726db05a1a`).
 That archive added six newer AMD source/header files relative to the public
-base. The V26 context-default diagnostic, V27 CU-mask profile, V29 framebuffer
+base. The V26 context-default register values, V27 CU-mask profile, V29 framebuffer
 layout, V30 opt-in user-fence experiment, and V32 lifecycle monitor are retained.
+Context defaults are now selected automatically for X940; the V16/V26 flags
+no longer select its context initialization method.
 The later device runners remain local diagnostic tools; generated captures,
 probe binaries, archives and backup sources are not part of this refactor.
 
@@ -72,6 +74,41 @@ Additional structural changes:
   `PA_SC_SHADER_CONTROL.LOAD_COLLISION_WAVEID` bit is reserved in MGFX2's
   header. Its protocol needs separate implementation and validation.
 
+## Context initialization
+
+The incremental context change is based on merged `main` at
+`a0c47a8f59d8f803cd4299206c4e45cc12f18442`. Previously, X940 inherited
+`has_clear_state = true` from its GFX10.3 compatibility level. The tested
+V26 profile then replaced CLEAR_STATE with a NOP and explicitly initialized
+the defaults through an environment variable. Without that variable the
+same chip took a different initialization path.
+
+Samsung's public SGPU source skips the generic clear-state block for MGFX
+in `gfx_v10_0_cp_async_gfx_start`; its MGFX RLC initialization also skips
+the generic AMD clear-state buffer setup. Reference:
+[gfx_v10_0.c at 6946920](https://github.com/Elchanz3/android_kernel_samsung_exynos2400/blob/6946920b36b6d6c99acad76aec6139004e1137c7/kernel/drivers/gpu/drm/samsung/gpu/sgpu/gfx_v10_0.c).
+This supports avoiding an assumed AMD context baseline. It does not establish
+that the opcode is physically absent, or that this custom kernel's runtime
+configuration matches the installed Samsung kernel.
+
+The capability now excludes X940, and
+`radv_emit_graphics_context_defaults()` emits the existing 34 default writes:
+ZMIN/ZMAX for 16 viewports at MGFX2's addresses and stride, the retained RADV
+edge rule, and zero hardware screen offset. Other AMD chips retain their
+previous capability and fallback behavior. The helper does not reconstruct
+a full PAL register shadow table or zero undocumented registers.
+
+`RADV_X940_NOP_CLEAR_STATE_V16` and `RADV_X940_DIAG_CONTEXT_DEFAULTS_V26`
+have no effect on this path; existing runners may still export them.
+The new `x940-context-init` marker reports the selected method. Two NOP
+packets used by the old diagnostic profile are removed. Normal final IB
+alignment remains the winsys's responsibility, so on-device captures must
+be regenerated rather than requiring their old lengths or hashes.
+
+This promotes a previously tested initialization profile. That profile also
+exhibited an intermittent hang, so this change alone is not evidence that
+the hang is resolved. Full context coverage and restoration remain open.
+
 ## Validation performed
 
 `bin/x940_regmap_audit.py` verifies all 85 named addresses in the new layout
@@ -94,8 +131,13 @@ dependency mocks capture their writes. Checks cover:
   masks and shifts. GFX11-only `PRIM_ATTR` is excluded from MGFX2 validation.
 - Compute and graphics preamble allocation failures return errors. The graphics
   caller discards any partial control-only CS.
-- The actual queue graphics emitter retains V26 defaults for all 16 viewports
-  with/without CLEAR_STATE; non-X940 GFX10–GFX12 output matches the baseline.
+- Eighteen capability combinations check the actual assignment across
+  GFX6–GFX12, with and without X940 identification.
+- The actual queue graphics emitter initializes all 16 depth ranges on X940
+  with every combination of the retired V16/V26 flags, without CLEAR_STATE.
+  Register values and executable control packets match the baseline V26
+  profile after removing exactly four NOP DWORDs. Non-X940 GFX10–GFX12 output
+  matches the baseline, with and without CLEAR_STATE.
 - The actual preamble failure cleanup block: only newly resident GDS/OA BOs
   are unresidented; old queue BOs are preserved.
 
@@ -139,6 +181,8 @@ python3 -B bin/x940_validate_framebuffer.py \
 3. Record command buffers without submission for the existing zero-draw and
    0/1/2/3-vertex cases. Decode the full preamble and main IB; review the
    intentional changes rather than requiring equality to an obsolete capture.
+   Run V29.1 again for the rebuilt library before passing its new output
+   directory to V37/V36; their old library-hash baseline cannot be reused.
 4. Run controlled execution with external GPU counters and the existing
    lifecycle log. Check completion, delayed resets and teardown separately.
    Stop the series on a counter increase or failed fence and capture bugreport.

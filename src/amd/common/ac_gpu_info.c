@@ -1293,8 +1293,14 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    /* The mere presence of CLEAR_STATE in the IB causes random GPU hangs
     * on GFX6. Some CLEAR_STATE cause asic hang on radeon kernel, etc.
     * SPI_VS_OUT_CONFIG. So only enable GFX7 CLEAR_STATE on amdgpu kernel.
+    *
+    * Samsung's MGFX async GFX initialization skips the generic clear-state
+    * block in the KMD.
+    * Do not infer a usable AMD CLEAR_STATE baseline from the GFX10.3
+    * compatibility level selected for Xclipse 940. Its UMD must emit the
+    * required context defaults explicitly.
     */
-   info->has_clear_state = info->gfx_level >= GFX7 && info->gfx_level < GFX12;
+   info->has_clear_state = info->gfx_level >= GFX7 && info->gfx_level < GFX12 && !info->is_xclipse940;
 
    info->has_distributed_tess =
       info->gfx_level >= GFX10 || (info->gfx_level >= GFX8 && info->max_se >= 2);

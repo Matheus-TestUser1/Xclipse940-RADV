@@ -240,6 +240,24 @@ static void radeon_emit_array(struct radeon_cmdbuf *c, const uint32_t *dw, unsig
 static struct ac_pm4_state *fault_pm4_create(const struct radeon_info *i, bool s, unsigned n, bool c) {
    (void)i;(void)s;(void)n;(void)c; return NULL;
 }
+static unsigned remove_nops(struct radeon_cmdbuf *cs) {
+   unsigned removed = 0, out = 0;
+   for (unsigned pos = 0; pos < cs->raw_count;) {
+      const uint32_t h = cs->raw[pos];
+      const unsigned size = ((h >> 16) & 0x3fff) + 2;
+      assert(h >> 30 == 3 && pos + size <= cs->raw_count);
+      if (((h >> 8) & 255) == PKT3_NOP) {
+         removed += size;
+      } else {
+         memmove(cs->raw + out, cs->raw + pos, size * sizeof(*cs->raw));
+         out += size;
+      }
+      pos += size;
+   }
+   memset(cs->raw + out, 0, (ARRAY_SIZE(cs->raw) - out) * sizeof(*cs->raw));
+   cs->raw_count = out;
+   return removed;
+}
 struct cleanup_winsys {
    void (*cs_destroy)(struct radeon_cmdbuf *);
    VkResult (*buffer_make_resident)(struct cleanup_winsys *, struct radeon_winsys_bo *, bool);
@@ -263,6 +281,7 @@ static void radv_bo_destroy(struct radv_device *d, void *alloc, struct radeon_wi
 RADV_MAIN = r'''
 int main(void) {
    check_fields();
+   check_clear_state_capability();
    struct radv_physical_device pdev = {.info = {.gfx_level = GFX10_3, .is_xclipse940 = true}};
    struct radv_device device = {.pdev = &pdev};
    struct radeon_cmdbuf cs = {0}, baseline_cs = {0};
@@ -413,13 +432,17 @@ int main(void) {
    puts("RADV: pointers, NGG/HS metadata, fragment writes, 1..16 viewports, guardband, conservative raster, alpha-to-mask, 128 color-control cases, AMD regression and allocation failure: OK");
    pdev.info.gfx_level = GFX10_3;
    pdev.info.is_xclipse940 = true;
+   set_clear_state_capability(&pdev.info);
+   assert(!pdev.info.has_clear_state);
    device.uses_shadow_regs = false;
    cs = (struct radeon_cmdbuf){0};
    assert(radv_emit_graphics_fault(&device, &cs) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(cs.count == 0); /* Callers discard any control-only failed preamble. */
-   for (unsigned clear = 0; clear < 2; ++clear) {
+   struct radeon_cmdbuf context_reference = {0};
+   for (unsigned nop = 0; nop < 2; ++nop) {
       for (unsigned defaults = 0; defaults < 2; ++defaults) {
-         pdev.info.has_clear_state = clear;
+         if (nop) setenv("RADV_X940_NOP_CLEAR_STATE_V16", "1", 1);
+         else unsetenv("RADV_X940_NOP_CLEAR_STATE_V16");
          if (defaults) setenv("RADV_X940_DIAG_CONTEXT_DEFAULTS_V26", "1", 1);
          else unsetenv("RADV_X940_DIAG_CONTEXT_DEFAULTS_V26");
          cs = (struct radeon_cmdbuf){0};
@@ -437,10 +460,31 @@ int main(void) {
                }
             }
          }
-         assert(zregs == ((!clear || defaults) ? 32 : 0));
+         assert(zregs == 32);
+         for (unsigned pos = 0; pos < cs.raw_count;) {
+            const uint32_t h = cs.raw[pos];
+            const unsigned size = ((h >> 16) & 0x3fff) + 2;
+            assert(h >> 30 == 3 && pos + size <= cs.raw_count);
+            assert(((h >> 8) & 255) != PKT3_CLEAR_STATE);
+            pos += size;
+         }
+         if (!nop && !defaults) context_reference = cs;
+         else assert(!memcmp(&cs, &context_reference, sizeof(cs)));
       }
    }
+   /* The tested V26 profile already initialized these defaults. Promote it
+    * without changing register values or executable packets; remove only
+    * its two padding NOP packets. */
+   setenv("RADV_X940_DIAG_CONTEXT_DEFAULTS_V26", "1", 1);
+   pdev.info.has_clear_state = true;
+   baseline_cs = (struct radeon_cmdbuf){0};
+   assert(radv_emit_graphics_baseline(&device, &baseline_cs) == VK_SUCCESS);
+   cs = context_reference;
+   assert(remove_nops(&cs) == 0);
+   assert(remove_nops(&baseline_cs) == 4);
+   assert(!memcmp(&cs, &baseline_cs, sizeof(cs)));
    unsetenv("RADV_X940_DIAG_CONTEXT_DEFAULTS_V26");
+   unsetenv("RADV_X940_NOP_CLEAR_STATE_V16");
    pdev.info.is_xclipse940 = false;
    for (unsigned i = 2; i < ARRAY_SIZE(levels); ++i) {
       pdev.info.gfx_level = levels[i];
@@ -452,7 +496,7 @@ int main(void) {
          assert(!memcmp(&cs, &baseline_cs, sizeof(cs)));
       }
    }
-   puts("Queue graphics preamble: V26 defaults, allocation failure and AMD regression: OK");
+   puts("Queue graphics preamble: automatic MGFX2 defaults, legacy flags invariant, V26 register/packet equivalence except four NOP DWORDs, allocation failure and AMD regression: OK");
    puts("GDS/OA failure cleanup: release only newly resident BOs; preserve old BOs: OK");
 }
 '''
@@ -464,7 +508,7 @@ def main():
     parser.add_argument("--offset-header", type=Path, required=True)
     parser.add_argument("--ip-header", type=Path, required=True)
     parser.add_argument("--mask-header", type=Path, required=True)
-    parser.add_argument("--baseline-ref", default="75db695acee70d0c4a4fa8228c2a323919c2a548")
+    parser.add_argument("--baseline-ref", default="a0c47a8f59d8f803cd4299206c4e45cc12f18442")
     parser.add_argument("--cc", default="cc")
     args = parser.parse_args()
     root = args.root.resolve()
@@ -498,6 +542,24 @@ def main():
                 macro = f"S_{prefix}_{field}"
                 field_checks.append(f"for (unsigned b = 0; b < 32; b++) assert({macro}(1u << b) == (((1u << b) & 0x{mask >> shift:x}u) << {shift}));")
         check_fields = "static void check_fields(void) {\n" + "\n".join(field_checks) + "\n}\n"
+        # Compile the actual capability assignment, without libdrm/IOCTLs.
+        gpu_info = (root / "src/amd/common/ac_gpu_info.c").read_text()
+        assignments = re.findall(r"(?m)^\s*(info->has_clear_state\s*=.*?;)", gpu_info)
+        if len(assignments) != 1:
+            raise ValueError("Expected one clear-state capability assignment")
+        capability_test = "static void set_clear_state_capability(struct radeon_info *info) {\n" + assignments[0] + "\n}\n"
+        capability_test += r'''
+static void check_clear_state_capability(void) {
+   const enum amd_gfx_level levels[] = {GFX6, GFX7, GFX8, GFX9, GFX10, GFX10_3, GFX11, GFX11_5, GFX12};
+   for (unsigned x940 = 0; x940 < 2; ++x940) {
+      for (unsigned j = 0; j < ARRAY_SIZE(levels); ++j) {
+         struct radeon_info info = {.is_xclipse940 = x940, .gfx_level = levels[j]};
+         set_clear_state_capability(&info);
+         assert(info.has_clear_state == (!x940 && j > 0 && j < ARRAY_SIZE(levels) - 1));
+      }
+   }
+}
+'''
         util = (root / "src/amd/common/ac_shader_util.h").read_text()
         decls = '#define AC_SHADER_UTIL_H\n#include "ac_gpu_info.h"\n'
         for name in ("gfx12_load_temporal_hint", "gfx12_store_temporal_hint", "gfx12_speculative_data_read"):
@@ -539,7 +601,7 @@ def main():
         queue = (root / "src/amd/vulkan/radv_queue.c").read_text()
         cmd = (root / "src/amd/vulkan/radv_cmd_buffer.c").read_text()
         shader = (root / "src/amd/vulkan/radv_shader.c").read_text()
-        test = helpers + RADV_MODEL + check_fields
+        test = helpers + RADV_MODEL + check_fields + capability_test
         for name, text in (("radv_emit_graphics_shader_pointers", queue), ("radv_emit_fragment_shader", cmd),
                            ("radv_emit_viewport", cmd), ("radv_emit_guardband_state", cmd),
                            ("radv_emit_conservative_rast_mode", cmd), ("radv_emit_alpha_to_coverage_enable", cmd),
@@ -553,6 +615,7 @@ def main():
         test += "\n" + function(shader, "radv_precompute_registers_pgm")
         test += "\n" + function(queue, "radv_pack_float_12p4")
         test += "\n" + function(queue, "radv_emit_compute")
+        test += "\n" + function(queue, "radv_emit_graphics_context_defaults")
         test += "\n" + function(queue, "radv_emit_graphics")
         test += "\n#define ac_pm4_create_sized fault_pm4_create\n"
         for name in ("radv_emit_compute", "radv_emit_graphics"):

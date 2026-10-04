@@ -736,19 +736,41 @@ radv_pack_float_12p4(float x)
    return x <= 0 ? 0 : x >= 4096 ? 0xffff : x * 16;
 }
 
+static void
+radv_emit_graphics_context_defaults(const struct radv_physical_device *pdev, struct radeon_cmdbuf *cs)
+{
+   /* These are the defaults RADV otherwise relies on CLEAR_STATE to supply.
+    * MGFX2 interleaves viewport transforms and depth with a 0x20 stride;
+    * changing the start address of the AMD Z array is not sufficient.
+    * This initializes the known defaults, not an entire PAL shadow table.
+    */
+   const unsigned zmin = ac_mgfx2_reg(pdev->info.is_xclipse940, R_0282D0_PA_SC_VPORT_ZMIN_0,
+                                    AC_MGFX2_PA_SC_VPORT_ZMIN_0);
+   const unsigned zmax = ac_mgfx2_reg(pdev->info.is_xclipse940, R_0282D4_PA_SC_VPORT_ZMAX_0,
+                                    AC_MGFX2_PA_SC_VPORT_ZMAX_0);
+   const unsigned viewport_stride = pdev->info.is_xclipse940 ? 0x20 : 8;
+   for (unsigned i = 0; i < 16; i++) {
+      radeon_set_context_reg(cs, zmin + i * viewport_stride, 0);
+      radeon_set_context_reg(cs, zmax + i * viewport_stride, fui(1.0));
+   }
+
+   /* Retain RADV's edge rule; stock's 0xaa99aaaa is a separate choice. */
+   radeon_set_context_reg(cs, R_028230_PA_SC_EDGERULE, 0xAAAAAAAA);
+   /* PA_SU_HARDWARE_SCREEN_OFFSET must be 0 due to hw bug on GFX6. */
+   radeon_set_context_reg(cs, R_028234_PA_SU_HARDWARE_SCREEN_OFFSET, 0);
+
+   if (pdev->info.is_xclipse940) {
+      fprintf(stderr, "x940-context-init: method=explicit_defaults clear_state=0 "
+                      "depth_ranges=16 edgerule=0xaaaaaaaa screen_offset=0\n");
+   }
+}
+
 VkResult
 radv_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
 {
    struct radv_physical_device *pdev = radv_device_physical(device);
    const uint64_t border_color_va = device->border_color_data.bo ? radv_buffer_get_va(device->border_color_data.bo) : 0;
-   /* MGFX skips the generic clear-state block in the Samsung kernel.
-    * Diagnostic: emit RADV's existing fallback defaults at MGFX2 addresses
-    * when testing without CLEAR_STATE. This is not a complete MGFX2 reset.
-    */
-   const bool x940_context_defaults =
-      pdev->info.is_xclipse940 && !device->uses_shadow_regs &&
-      getenv("RADV_X940_DIAG_CONTEXT_DEFAULTS_V26");
-   bool has_clear_state = pdev->info.has_clear_state;
+   const bool has_clear_state = pdev->info.has_clear_state;
    int i;
 
    if (!device->uses_shadow_regs) {
@@ -757,10 +779,7 @@ radv_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
       radeon_emit(cs, CC1_UPDATE_SHADOW_ENABLES(1));
 
       if (has_clear_state) {
-         const bool x940_nop_clear_state =
-            pdev->info.is_xclipse940 &&
-            (getenv("RADV_X940_NOP_CLEAR_STATE_V16") || x940_context_defaults);
-         radeon_emit(cs, PKT3(x940_nop_clear_state ? PKT3_NOP : PKT3_CLEAR_STATE, 0, 0));
+         radeon_emit(cs, PKT3(PKT3_CLEAR_STATE, 0, 0));
          radeon_emit(cs, 0);
       }
    }
@@ -775,36 +794,8 @@ radv_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
 
    ac_init_graphics_preamble_state(&preamble_state, pm4);
 
-   if (!has_clear_state || x940_context_defaults) {
-      /* GC 10.4 M2: DWORD offsets 0x117/0x118 in GC segment 1 (0xa000).
-       * MGFX2 interleaves viewport transforms and depth, with a 0x20 stride.
-       * Generic 0x0282d0/0x0282d4 and their 8-byte stride do not apply.
-       */
-      const unsigned zmin = ac_mgfx2_reg(pdev->info.is_xclipse940, R_0282D0_PA_SC_VPORT_ZMIN_0,
-                                       AC_MGFX2_PA_SC_VPORT_ZMIN_0);
-      const unsigned zmax = ac_mgfx2_reg(pdev->info.is_xclipse940, R_0282D4_PA_SC_VPORT_ZMAX_0,
-                                       AC_MGFX2_PA_SC_VPORT_ZMAX_0);
-      const unsigned viewport_stride = pdev->info.is_xclipse940 ? 0x20 : 8;
-      for (i = 0; i < 16; i++) {
-         radeon_set_context_reg(cs, zmin + i * viewport_stride, 0);
-         radeon_set_context_reg(cs, zmax + i * viewport_stride, fui(1.0));
-      }
-   }
-
-   if (!has_clear_state || x940_context_defaults) {
-      /* Retain RADV's edge rule; stock's 0xaa99aaaa is a separate choice. */
-      radeon_set_context_reg(cs, R_028230_PA_SC_EDGERULE, 0xAAAAAAAA);
-      /* PA_SU_HARDWARE_SCREEN_OFFSET must be 0 due to hw bug on GFX6 */
-      radeon_set_context_reg(cs, R_028234_PA_SU_HARDWARE_SCREEN_OFFSET, 0);
-   }
-   if (x940_context_defaults) {
-      /* 34 SET packets use 102 DWORDs. Keep this diagnostic addition at
-       * 104 DWORDs, preserving the original final IB padding exactly.
-       */
-      radeon_emit(cs, PKT3(PKT3_NOP, 0, 0));
-      radeon_emit(cs, 0);
-      fprintf(stderr, "x940-context-defaults-v26: depth_ranges=16 edgerule=0xaaaaaaaa screen_offset=0\n");
-   }
+   if (!has_clear_state)
+      radv_emit_graphics_context_defaults(pdev, cs);
 
    if (pdev->info.gfx_level <= GFX8)
       radeon_set_sh_reg(cs, R_00B324_SPI_SHADER_PGM_HI_ES, S_00B324_MEM_BASE(pdev->info.address32_hi >> 8));

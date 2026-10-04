@@ -92,7 +92,7 @@ struct radeon_info {
 
    bool is_pro_graphics;
    bool has_graphics; /* false if the chip is compute-only */
-   bool has_clear_state;
+   bool has_clear_state; /* CLEAR_STATE supplies a usable context baseline. */
    bool has_distributed_tess;
    bool has_dcc_constant_encode;
    bool has_tc_compatible_htile;
