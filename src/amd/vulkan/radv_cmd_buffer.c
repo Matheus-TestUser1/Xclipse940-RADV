@@ -2114,6 +2114,69 @@ radv_emit_hw_ls(struct radv_cmd_buffer *cmd_buffer, const struct radv_shader *sh
    radeon_set_sh_reg(cmd_buffer->cs, shader->info.regs.pgm_rsrc1, shader->config.rsrc1);
 }
 
+/* V27 diagnostic: Samsung's MGFX2 emitter selects 0x3e (CUMASK) or
+ * 0x9b for the SAME sequential RSRC3/4 payload. The stock capture uses
+ * c0023e08 3000008a 0000ffff 82000000. The firmware applies CU masking;
+ * the payload is not a readback of the final hardware register values.
+ * Keep this experiment restricted to the exact V23/V25 empty stock GS.
+ */
+static bool
+radv_x940_emit_ngg_cumask_v27(struct radeon_cmdbuf *cs, const struct radv_shader *shader)
+{
+   if (!getenv("RADV_X940_DIAG_GS_CUMASK_V27"))
+      return false;
+
+   static const uint32_t expected[33] = {
+      0xb080400au, 0xb07effffu, 0xbe844780u, 0xbe840008u, 0xbf840003u, 0x9300ff02u,
+      0x00090016u, 0x9301ff03u, 0x00040018u, 0xbf8b0011u, 0xd71f0001u, 0x000100c1u,
+      0xbf870001u, 0xd60b0001u, 0x04054001u, 0xbe81007eu, 0xbf870001u, 0xd4c9007eu,
+      0x00000101u, 0xbfa50002u, 0xf8000941u, 0x00000000u, 0xbf89fff0u, 0xbefe0001u,
+      0x9300ff02u, 0x0009000cu, 0xbe81007eu, 0xd4c9007eu, 0x00000101u, 0xbfa50002u,
+      0xf80008c0u, 0x00000000u, 0xbfb00000u,
+   };
+   const char *cache_off = getenv("MESA_SHADER_CACHE_DISABLE");
+   if (!getenv("RADV_X940_DIAG_STOCK_EMPTY_VS_V23") ||
+       !getenv("RADV_X940_DIAG_STOCK_RESOURCES_V25") ||
+       !cache_off || strcmp(cache_off, "1") ||
+       shader->info.stage != MESA_SHADER_VERTEX || !shader->info.is_ngg ||
+       !shader->info.is_ngg_passthrough || shader->info.wave_size != 32 ||
+       shader->exec_size != sizeof(expected) || shader->code_size != 388 ||
+       !shader->code || memcmp(shader->code, expected, sizeof(expected)) ||
+       shader->config.rsrc1 != 0x282c0081u || shader->config.rsrc2 != 0x14u ||
+       getenv("RADV_X940_SKIP_NGG_RSRC34") ||
+       getenv("RADV_X940_DIAG_NGG_RSRC4_GFX11")) {
+      fprintf(stderr, "x940-cumask-v27: REFUSED: exact V23/V25 profile required\n");
+      return false;
+   }
+   for (unsigned i = sizeof(expected); i < shader->code_size; i += 4) {
+      uint32_t padding;
+      memcpy(&padding, (const char *)shader->code + i, sizeof(padding));
+      if (padding != 0xbf9f0000u) {
+         fprintf(stderr, "x940-cumask-v27: REFUSED: stock padding differs\n");
+         return false;
+      }
+   }
+
+   const bool stock_values = getenv("RADV_X940_DIAG_STOCK_GS34_V27");
+   const uint32_t rsrc3 = stock_values ? 0x0000ffffu : shader->info.regs.spi_shader_pgm_rsrc3_gs;
+   const uint32_t rsrc4 = stock_values ? 0x82000000u : shader->info.regs.spi_shader_pgm_rsrc4_gs;
+   /* Reproduce the observed MGFX2 header, including its low bit 3.
+    * Do not reinterpret that bit using the desktop RESET_FILTER_CAM macro.
+    */
+   radeon_emit(cs, 0xc0023e08u);
+   radeon_emit(cs, 0x3000008au); /* (0xb228 - 0xb000) / 4, index 3 */
+   radeon_emit(cs, rsrc3);
+   radeon_emit(cs, rsrc4);
+   /* Two original 3-DWORD packets become 4 DWORDs + a 2-DWORD NOP.
+    * Keep all following packet offsets and final padding unchanged.
+    */
+   radeon_emit(cs, PKT3(PKT3_NOP, 0, 0));
+   radeon_emit(cs, 0);
+   fprintf(stderr, "x940-cumask-v27: mode=%s RSRC3=0x%08x RSRC4=0x%08x header=0xc0023e08\n",
+           stock_values ? "stock_gs" : "packet_only", rsrc3, rsrc4);
+   return true;
+}
+
 static void
 radv_emit_hw_ngg(struct radv_cmd_buffer *cmd_buffer, const struct radv_shader *es, const struct radv_shader *shader)
 {
@@ -2545,7 +2608,10 @@ radv_emit_hw_ngg(struct radv_cmd_buffer *cmd_buffer, const struct radv_shader *e
                  "x940-mgfx2-ngg: using RSRC3=B228 RSRC4=B22C path\n");
       }
 
-      if (pdev->info.gfx_level >= GFX7 &&
+      const bool x940_cumask_v27 =
+         pdev->info.is_xclipse940 && radv_x940_emit_ngg_cumask_v27(cmd_buffer->cs, shader);
+
+      if (!x940_cumask_v27 && pdev->info.gfx_level >= GFX7 &&
           !(pdev->info.is_xclipse940 &&
             getenv("RADV_X940_SKIP_NGG_RSRC34"))) {
          radeon_set_sh_reg_idx(&pdev->info, cmd_buffer->cs,
@@ -2573,7 +2639,7 @@ radv_emit_hw_ngg(struct radv_cmd_buffer *cmd_buffer, const struct radv_shader *e
          fprintf(stderr, "x940-ngg-rsrc4: old=0x%08x new=0x%08x\n",
                  shader->info.regs.spi_shader_pgm_rsrc4_gs, rsrc4);
       }
-      if (!(pdev->info.is_xclipse940 &&
+      if (!x940_cumask_v27 && !(pdev->info.is_xclipse940 &&
             getenv("RADV_X940_SKIP_NGG_RSRC34"))) {
          radeon_set_sh_reg_idx(&pdev->info, cmd_buffer->cs,
                                pdev->info.is_xclipse940
@@ -4194,7 +4260,9 @@ radv_emit_logic_op(struct radv_cmd_buffer *cmd_buffer)
    if (pdev->info.gfx_level >= GFX12) {
       radeon_set_context_reg(cmd_buffer->cs, R_028858_CB_COLOR_CONTROL, cb_color_control);
    } else {
-      radeon_set_context_reg(cmd_buffer->cs, R_028808_CB_COLOR_CONTROL, cb_color_control);
+      radeon_set_context_reg(cmd_buffer->cs,
+                             ac_mgfx2_reg(pdev->info.is_xclipse940, R_028808_CB_COLOR_CONTROL,
+                                          AC_MGFX2_CB_COLOR_CONTROL), cb_color_control);
    }
 }
 
@@ -4464,7 +4532,31 @@ radv_emit_fb_color_state(struct radv_cmd_buffer *cmd_buffer, int index, struct r
       cb_color_info &= C_028C70_COMPRESSION;
    }
 
-   if (pdev->info.gfx_level >= GFX12) {
+   if (pdev->info.is_xclipse940) {
+      /* MGFX2 has nine consecutive registers per MRT, without PITCH/SLICE.
+       * INFO and the address extensions are separate arrays.
+       */
+      radeon_set_context_reg_seq(cmd_buffer->cs, ac_mgfx2_cb_color_base(index), 9);
+      radeon_emit(cmd_buffer->cs, cb->ac.cb_color_base);             /* BASE */
+      radeon_emit(cmd_buffer->cs, cb->ac.cb_color_view);             /* VIEW */
+      radeon_emit(cmd_buffer->cs, ac_mgfx2_cb_attrib(cb->ac.cb_color_attrib));
+      radeon_emit(cmd_buffer->cs, cb->ac.cb_dcc_control);            /* DCC_CONTROL */
+      radeon_emit(cmd_buffer->cs, cb->ac.cb_color_cmask);            /* CMASK */
+      radeon_emit(cmd_buffer->cs, cb->ac.cb_color_fmask);            /* FMASK */
+      radeon_emit(cmd_buffer->cs, cb->ac.cb_dcc_base);               /* DCC_BASE */
+      radeon_emit(cmd_buffer->cs, cb->ac.cb_color_attrib2);           /* ATTRIB2 */
+      radeon_emit(cmd_buffer->cs, ac_mgfx2_cb_attrib3(cb->ac.cb_color_attrib3));
+
+      radeon_set_context_reg(cmd_buffer->cs, AC_MGFX2_CB_COLOR0_INFO + index * 4, cb_color_info);
+      radeon_set_context_reg(cmd_buffer->cs, AC_MGFX2_CB_COLOR0_BASE_EXT + index * 4,
+                             S_028E40_BASE_256B(cb->ac.cb_color_base >> 32));
+      radeon_set_context_reg(cmd_buffer->cs, AC_MGFX2_CB_COLOR0_CMASK_BASE_EXT + index * 4,
+                             S_028E60_BASE_256B(cb->ac.cb_color_cmask >> 32));
+      radeon_set_context_reg(cmd_buffer->cs, AC_MGFX2_CB_COLOR0_FMASK_BASE_EXT + index * 4,
+                             S_028E80_BASE_256B(cb->ac.cb_color_fmask >> 32));
+      radeon_set_context_reg(cmd_buffer->cs, AC_MGFX2_CB_COLOR0_DCC_BASE_EXT + index * 4,
+                             S_028EA0_BASE_256B(cb->ac.cb_dcc_base >> 32));
+   } else if (pdev->info.gfx_level >= GFX12) {
       radeon_set_context_reg(cmd_buffer->cs, R_028C60_CB_COLOR0_BASE + index * 0x24, cb->ac.cb_color_base);
       radeon_set_context_reg(cmd_buffer->cs, R_028C64_CB_COLOR0_VIEW + index * 0x24, cb->ac.cb_color_view);
       radeon_set_context_reg(cmd_buffer->cs, R_028C68_CB_COLOR0_VIEW2 + index * 0x24, cb->ac.cb_color_view2);
@@ -4662,13 +4754,39 @@ radv_emit_fb_ds_state(struct radv_cmd_buffer *cmd_buffer, struct radv_ds_buffer_
 
    if (pdev->info.gfx_level < GFX12) {
       radeon_set_context_reg(cmd_buffer->cs, ac_mgfx2_reg(pdev->info.is_xclipse940, R_028000_DB_RENDER_CONTROL, AC_MGFX2_DB_RENDER_CONTROL), db_render_control);
-      radeon_set_context_reg(cmd_buffer->cs, R_028008_DB_DEPTH_VIEW, ds->ac.db_depth_view);
-      radeon_set_context_reg(cmd_buffer->cs, R_028ABC_DB_HTILE_SURFACE, db_htile_surface);
+      radeon_set_context_reg(cmd_buffer->cs, ac_mgfx2_reg(pdev->info.is_xclipse940, R_028008_DB_DEPTH_VIEW,
+                                               AC_MGFX2_DB_DEPTH_VIEW), ds->ac.db_depth_view);
+      radeon_set_context_reg(cmd_buffer->cs, ac_mgfx2_reg(pdev->info.is_xclipse940, R_028ABC_DB_HTILE_SURFACE,
+                                               AC_MGFX2_DB_HTILE_SURFACE), db_htile_surface);
    }
 
    radeon_set_context_reg(cmd_buffer->cs, ac_mgfx2_reg(pdev->info.is_xclipse940, R_028010_DB_RENDER_OVERRIDE2, AC_MGFX2_DB_RENDER_OVERRIDE2), ds->db_render_override2);
 
-   if (pdev->info.gfx_level >= GFX12) {
+   if (pdev->info.is_xclipse940) {
+      radeon_set_context_reg(cmd_buffer->cs, AC_MGFX2_DB_HTILE_DATA_BASE, db_htile_data_base);
+      radeon_set_context_reg(cmd_buffer->cs, AC_MGFX2_DB_DEPTH_SIZE_XY, ds->ac.db_depth_size);
+
+      /* 0x02803c is DEPTH_SIZE_XY on MGFX2, not AMD's DEPTH_INFO. */
+      radeon_set_context_reg_seq(cmd_buffer->cs, AC_MGFX2_DB_Z_INFO, 6);
+      radeon_emit(cmd_buffer->cs, db_z_info);
+      radeon_emit(cmd_buffer->cs, ds->ac.db_stencil_info);
+      radeon_emit(cmd_buffer->cs, ds->ac.db_depth_base);
+      radeon_emit(cmd_buffer->cs, ds->ac.db_stencil_base);
+      radeon_emit(cmd_buffer->cs, ds->ac.db_depth_base);
+      radeon_emit(cmd_buffer->cs, ds->ac.db_stencil_base);
+
+      /* The five high-address registers are not consecutive on MGFX2. */
+      radeon_set_context_reg(cmd_buffer->cs, AC_MGFX2_DB_Z_READ_BASE_HI,
+                             S_028068_BASE_HI(ds->ac.db_depth_base >> 32));
+      radeon_set_context_reg(cmd_buffer->cs, AC_MGFX2_DB_STENCIL_READ_BASE_HI,
+                             S_02806C_BASE_HI(ds->ac.db_stencil_base >> 32));
+      radeon_set_context_reg(cmd_buffer->cs, AC_MGFX2_DB_Z_WRITE_BASE_HI,
+                             S_028070_BASE_HI(ds->ac.db_depth_base >> 32));
+      radeon_set_context_reg(cmd_buffer->cs, AC_MGFX2_DB_STENCIL_WRITE_BASE_HI,
+                             S_028074_BASE_HI(ds->ac.db_stencil_base >> 32));
+      radeon_set_context_reg(cmd_buffer->cs, AC_MGFX2_DB_HTILE_DATA_BASE_HI,
+                             S_028078_BASE_HI(db_htile_data_base >> 32));
+   } else if (pdev->info.gfx_level >= GFX12) {
       radeon_set_context_reg(cmd_buffer->cs, R_028004_DB_DEPTH_VIEW, ds->ac.db_depth_view);
       radeon_set_context_reg(cmd_buffer->cs, R_028008_DB_DEPTH_VIEW1, ds->ac.u.gfx12.db_depth_view1);
       radeon_set_context_reg(cmd_buffer->cs, R_028014_DB_DEPTH_SIZE_XY, ds->ac.db_depth_size);
@@ -5068,6 +5186,7 @@ radv_update_bound_fast_clear_color(struct radv_cmd_buffer *cmd_buffer, struct ra
                                    uint32_t color_values[2])
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radeon_cmdbuf *cs = cmd_buffer->cs;
 
    if (cb_idx >= cmd_buffer->state.render.color_att_count || cmd_buffer->state.render.color_att[cb_idx].iview == NULL ||
@@ -5076,7 +5195,9 @@ radv_update_bound_fast_clear_color(struct radv_cmd_buffer *cmd_buffer, struct ra
 
    ASSERTED unsigned cdw_max = radeon_check_space(device->ws, cmd_buffer->cs, 4);
 
-   radeon_set_context_reg_seq(cs, R_028C8C_CB_COLOR0_CLEAR_WORD0 + cb_idx * 0x3c, 2);
+   const unsigned reg = pdev->info.is_xclipse940 ? ac_mgfx2_cb_clear_word0(cb_idx)
+                                                : R_028C8C_CB_COLOR0_CLEAR_WORD0 + cb_idx * 0x3cu;
+   radeon_set_context_reg_seq(cs, reg, 2);
    radeon_emit(cs, color_values[0]);
    radeon_emit(cs, color_values[1]);
 
@@ -5169,7 +5290,8 @@ radv_load_color_clear_metadata(struct radv_cmd_buffer *cmd_buffer, struct radv_i
    }
 
    uint64_t va = radv_image_get_fast_clear_va(image, iview->vk.base_mip_level);
-   uint32_t reg = R_028C8C_CB_COLOR0_CLEAR_WORD0 + cb_idx * 0x3c;
+   const unsigned reg = pdev->info.is_xclipse940 ? ac_mgfx2_cb_clear_word0(cb_idx)
+                                                : R_028C8C_CB_COLOR0_CLEAR_WORD0 + cb_idx * 0x3cu;
 
    if (pdev->info.has_load_ctx_reg_pkt) {
       radeon_emit(cs, PKT3(PKT3_LOAD_CONTEXT_REG_INDEX, 3, cmd_buffer->state.predicating));
@@ -5284,7 +5406,9 @@ radv_emit_framebuffer_state(struct radv_cmd_buffer *cmd_buffer)
                                                             : S_028C70_FORMAT_GFX6(V_028C70_COLOR_INVALID);
    VkExtent2D extent = {MAX_FRAMEBUFFER_WIDTH, MAX_FRAMEBUFFER_HEIGHT};
 
-   ASSERTED unsigned cdw_max = radeon_check_space(device->ws, cmd_buffer->cs, 51 + MAX_RTS * 70);
+   /* Individual MGFX2 DB high-address writes need seven extra dwords. */
+   const unsigned fixed_dw = pdev->info.is_xclipse940 ? 58 : 51;
+   ASSERTED unsigned cdw_max = radeon_check_space(device->ws, cmd_buffer->cs, fixed_dw + MAX_RTS * 70);
 
    for (i = 0; i < render->color_att_count; ++i) {
       struct radv_image_view *iview = render->color_att[i].iview;

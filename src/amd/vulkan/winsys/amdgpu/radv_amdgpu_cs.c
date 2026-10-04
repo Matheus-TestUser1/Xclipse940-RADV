@@ -10,6 +10,7 @@
 #include <libsync.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <string.h>
 #include "drm-uapi/amdgpu_drm.h"
 
 #include "util/detect_os.h"
@@ -152,6 +153,8 @@ struct radv_amdgpu_cs_request {
     */
    uint64_t seq_no;
 };
+
+#include "radv_x940_diag_v32.h"
 
 static VkResult radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request *request,
                                       struct radv_winsys_sem_info *sem_info);
@@ -1656,6 +1659,8 @@ radv_amdgpu_ctx_create(struct radeon_winsys *_ws, enum radeon_ctx_priority prior
       goto fail_alloc;
    }
 
+   radv_x940_diag_v32_ctx_init(ctx);
+
    *rctx = (struct radeon_winsys_ctx *)ctx;
    return VK_SUCCESS;
 
@@ -1671,6 +1676,8 @@ radv_amdgpu_ctx_destroy(struct radeon_winsys_ctx *rwctx)
 {
    struct radv_amdgpu_ctx *ctx = (struct radv_amdgpu_ctx *)rwctx;
 
+   radv_x940_diag_v32_ctx_destroy(ctx);
+
    if (ctx->ws->info.is_sgpu &&
        getenv("RADV_X940_DIAG_KMD_RESET")) {
       uint64_t reset_flags = 0;
@@ -1682,7 +1689,7 @@ radv_amdgpu_ctx_destroy(struct radeon_winsys_ctx *rwctx)
 
       fprintf(stderr,
               "x940-kmd-reset: q2=%d flags=0x%016llx "
-              "q1=%d state=%u hangs=%u\\n",
+              "q1=%d state=%u hangs=%u\n",
               qr2,
               (unsigned long long)reset_flags,
               qr1,
@@ -1702,7 +1709,7 @@ radv_amdgpu_ctx_destroy(struct radeon_winsys_ctx *rwctx)
 
             fprintf(stderr,
                     "x940-kmd-fence: ip=%u ring=%u seq=%llu "
-                    "query=%d expired=%u\\n",
+                    "query=%d expired=%u\n",
                     ip,
                     ring,
                     (unsigned long long)f->fence,
@@ -1879,6 +1886,18 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
    int i;
    VkResult result = VK_SUCCESS;
    bool has_user_fence = radv_amdgpu_cs_has_user_fence(request);
+
+   /* V30 diagnostic: keep Vulkan syncobjs and KMD sequence fences, but omit
+    * the user-fence BO chunk on Xclipse 940 graphics only. Opt-in, unchanged
+    * compute and unchanged behavior when this exact flag is absent.
+    */
+   const char *x940_no_user_fence = getenv("RADV_X940_DIAG_NO_USER_FENCE_V30");
+   if (ctx->ws->info.is_xclipse940 && request->ip_type == AMDGPU_HW_IP_GFX &&
+       x940_no_user_fence && !strcmp(x940_no_user_fence, "1")) {
+      has_user_fence = false;
+      fprintf(stderr, "x940-user-fence-v30: omit=1 ip=%u ring=%u syncobj=preserved\n",
+              request->ip_type, request->ring);
+   }
    uint32_t queue_syncobj = radv_amdgpu_ctx_queue_syncobj(ctx, request->ip_type, request->ring);
    bool *queue_syncobj_wait = &ctx->queue_syncobj_wait[request->ip_type][request->ring];
 
@@ -2012,7 +2031,9 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
       if (r == -ENOMEM)
          os_time_sleep(1000);
 
+      uint64_t x940_submit_id_v32 = radv_x940_diag_v32_submit_begin(ctx, request, num_chunks, chunks);
       r = amdgpu_cs_submit_raw2(ctx->ws->dev, ctx->ctx, 0, num_chunks, chunks, &request->seq_no);
+      radv_x940_diag_v32_submit_result(ctx, request, x940_submit_id_v32, r);
       if (getenv("RADV_X940_DIAG_SUBMIT_RAW")) {
          fprintf(stderr, "x940-submit-raw2: r=%d seq_no=%llu ip=%u ring=%u chunks=%d\n",
                  r, (unsigned long long)request->seq_no,
@@ -2068,7 +2089,7 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
 
       fprintf(stderr,
               "x940-raw-fence: seq=%llu ip=%u ring=%u "
-              "query=%d expired=%u elapsed_ms=%.3f\\n",
+              "query=%d expired=%u elapsed_ms=%.3f\n",
               (unsigned long long)request->seq_no,
               request->ip_type,
               request->ring,
@@ -2078,7 +2099,7 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
 
       fprintf(stderr,
               "x940-raw-reset: q2=%d flags=0x%016llx "
-              "q1=%d state=%u hangs=%u\\n",
+              "q1=%d state=%u hangs=%u\n",
               qr2,
               (unsigned long long)reset_flags,
               qr1,

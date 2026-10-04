@@ -2,12 +2,15 @@
 
 ## Source and limits
 
-This refactor was prepared against public `main` at
-`75db695acee70d0c4a4fa8228c2a323919c2a548` on 2026-10-03. Its driver sources
-still contain the V25 bring-up changes. The device owner's V26–V36 changes
-are newer than this public snapshot. This patch must be reconciled with those
-sources before deployment; replacing the owner's files with this snapshot
-would lose later framebuffer, CU-mask and diagnostic work.
+The initial refactor used public `main` at
+`75db695acee70d0c4a4fa8228c2a323919c2a548`. It is now reconciled with the
+owner's source archive `x940-projeto-fontes-20261003-213344.tar.xz`
+(SHA256 `4fb8cff4814709db37f9ad4243111fe74511c2991caf4e17ee4253726db05a1a`).
+That archive added six newer AMD source/header files relative to the public
+base. The V26 context-default diagnostic, V27 CU-mask profile, V29 framebuffer
+layout, V30 opt-in user-fence experiment, and V32 lifecycle monitor are retained.
+The later device runners remain local diagnostic tools; generated captures,
+probe binaries, archives and backup sources are not part of this refactor.
 
 The hardware references are Samsung's `gc_10_4_0_offset_m2.h`,
 `gc_10_4_0_sh_mask_m2.h` and `vangogh_lite_ip_offset.h`. Addresses are derived
@@ -34,6 +37,8 @@ The port avoids the unverified legacy VS path and legacy GS ring-size writes.
 | Pixel shader control | `0x028c40`, aliases MGFX2 raster mode control | `0x028c58` |
 | Clip and raster mode control | Correct mapping depended on a diagnostic environment variable | Always map X940 to `0x028814/0x028810` |
 | Guardband packet | Four values from `0x028be8` | Four values from `0x028434` |
+| Color buffer control | `0x028808` | `0x028de0`; retained MODE/ROP3/DISABLE_DUAL_QUAD fields verified |
+| Framebuffer, retained from V29 | AMD CB/DB ranges and field assumptions | Nine CB registers per MRT with `0x24` stride; separate INFO/EXT/clear arrays; 17 DB writes with separate high addresses |
 | Render target write mask | `0x028238` | `0x028de8` |
 | Conservative rasterization control | `0x028c4c` | `0x028c54` |
 | Tessellation parameter control | `0x028b6c` | `0x028aa8` |
@@ -45,7 +50,8 @@ Additional structural changes:
 
 - Introduce `ac_mgfx2_regs.h`: an unversioned, named layout shared by writers
   and shader metadata. Keep `ac_x940_reg_v25.h` as a forwarding compatibility
-  header for later local bring-up patches.
+  header for local bring-up packages. The V29 framebuffer compatibility header
+  likewise forwards to the shared addresses and field helpers.
 - Skip legacy VS initialization on X940, retaining PS/HS setup. Keep NGG
   enabled on X940 so `RADV_DEBUG=nongg` cannot select the unverified VS block.
 - Initialize ES program address high in the preamble. Separately compiled
@@ -68,9 +74,9 @@ Additional structural changes:
 
 ## Validation performed
 
-`bin/x940_regmap_audit.py` verifies all 68 named addresses in the new layout
+`bin/x940_regmap_audit.py` verifies all 85 named addresses in the new layout
 against the kernel headers and records other source references for review.
-On this snapshot it scans 463 files and derives 3,752 named GC registers.
+On this snapshot it scans 465 files and derives 3,752 named GC registers.
 Its candidate counts do **not** count confirmed runtime bugs.
 
 `bin/x940_validate_emitters.py` compiles actual common preamble/PM4 source
@@ -82,12 +88,26 @@ dependency mocks capture their writes. Checks cover:
 - MGFX2 preamble: no legacy VS writes; PS/HS retained; correct ES high address.
 - Descriptor pointers and merged/separately compiled NGG and hull metadata.
 - Fragment writes, viewport counts 1–16, guardband, conservative rasterization
-  and alpha to coverage; non-X940 output matches the baseline.
-- Fifty-seven retained field macros, testing each input bit against Samsung
+  and alpha to coverage; 128 color-control combinations; non-X940 output
+  matches the baseline.
+- Sixty retained field macros, testing each input bit against Samsung
   masks and shifts. GFX11-only `PRIM_ATTR` is excluded from MGFX2 validation.
-- Compute preamble allocation failure returns an error without emitting data.
+- Compute and graphics preamble allocation failures return errors. The graphics
+  caller discards any partial control-only CS.
+- The actual queue graphics emitter retains V26 defaults for all 16 viewports
+  with/without CLEAR_STATE; non-X940 GFX10–GFX12 output matches the baseline.
 - The actual preamble failure cleanup block: only newly resident GDS/OA BOs
   are unresidented; old queue BOs are preserved.
+
+`bin/x940_validate_framebuffer.py` compiles the actual framebuffer branches
+and fast-clear functions against independently supplied Samsung headers:
+
+- 2,048 CB packets: all 256 moved-field combinations across eight MRTs.
+- Address/value order, separate INFO and EXT arrays, packet lengths, ATTRIB3
+  reserved bits, and retained VIEW/ATTRIB2/DB field masks.
+- Seventeen depth/stencil writes in 41 dwords, including all high-address
+  registers; DEPTH_SIZE_XY is not overwritten by AMD DEPTH_INFO.
+- Fast-clear write, LOAD and COPY paths with guards, including AMD regression.
 
 This is host validation of emission and cleanup. The complete Android driver
 has **not** been built in this environment, and no GPU submission was made.
@@ -103,14 +123,18 @@ python3 -B bin/x940_regmap_audit.py \
 python3 -B bin/x940_validate_emitters.py \
   --offset-header "$OFFSET_HEADER" --ip-header "$IP_HEADER" \
   --mask-header "$MASK_HEADER"
+
+python3 -B bin/x940_validate_framebuffer.py \
+  --offset-header "$OFFSET_HEADER" --ip-header "$IP_HEADER" \
+  --mask-header "$MASK_HEADER"
 ```
 
 ## Remaining work before GPU tests
 
-1. Merge with the owner's current sources. Preserve the V26 context-default
-   diagnostic, V27 CU-mask work, V29 framebuffer layout and later diagnostics.
-   Public V25 still has CB/DB framebuffer ranges that later local patches
-   corrected; this patch does not reproduce that missing framebuffer port.
+1. Apply the incremental patch prepared for the supplied archive, or inspect
+   this PR branch. Do not apply the original public-base patch to newer local
+   files. The old `test_v29_framebuffer.py` uses exact versioned source-string
+   matches; use the new framebuffer validator after refactoring.
 2. Build the full Android driver. Record the library hash used on the device.
 3. Record command buffers without submission for the existing zero-draw and
    0/1/2/3-vertex cases. Decode the full preamble and main IB; review the
@@ -118,12 +142,16 @@ python3 -B bin/x940_validate_emitters.py \
 4. Run controlled execution with external GPU counters and the existing
    lifecycle log. Check completion, delayed resets and teardown separately.
    Stop the series on a counter increase or failed fence and capture bugreport.
-5. Audit remaining enabled features by their actual MGFX2 path: framebuffer
-   and fast clear, queries/streamout, tessellation, scratch, shader resources,
+5. Audit remaining enabled features by their actual MGFX2 path: actual rendering/fast clear, queries/streamout, tessellation, scratch, shader resources,
    context restoration and queue synchronization. A matching address alone
    does not validate fields, range strides, shader ABI or packet semantics.
 
 `SPI_BUSY` and an incomplete primitive threshold help narrow the investigation.
+Remaining source candidates also include SPM/SQTT profiling paths and
+registers belonging to other AMD generations. Those paths need explicit guard
+and packet reviews before enabling them on MGFX2. This refactor does not claim
+to have completed the entire hardware port.
+
 They do not prove that a one-vertex draw never launches a shader, that userdata
 is the cause, or that the process named in a later reset caused the original
 fault. Early fence signaling and leaked global state remain hypotheses until

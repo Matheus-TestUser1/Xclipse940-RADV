@@ -21,7 +21,7 @@ from x940_regmap_audit import kernel_map, numeric_defines
 
 
 def function(source, name):
-    match = re.search(r"(?m)^(?:static )?(?:void|VkResult|uint32_t)\s+" + re.escape(name) + r"\(", source)
+    match = re.search(r"(?m)^(?:static )?(?:void|VkResult|uint32_t|unsigned)\s+" + re.escape(name) + r"\(", source)
     if not match:
         raise ValueError(f"Function not found: {name}")
     start = source.index("{", match.end())
@@ -44,12 +44,23 @@ def run(command, **kwargs):
     return subprocess.run(command, check=True, capture_output=True, text=True, **kwargs)
 
 
+def generate_amd_header(root):
+    meson = (root / "src/amd/common/meson.build").read_text()
+    json_list = re.search(r"amd_json_files\s*=\s*\[(.*?)\n\]", meson, re.S)[1]
+    json_files = re.findall(r"'([^']+\.json)'", json_list)
+    return run([sys.executable, "-B", str(root / "src/amd/registers/makeregheader.py"),
+         "--sort", "address", "--guard", "AMDGFXREGS_H",
+         *(str(root / "src/amd/common" / name) for name in json_files)],
+         env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1")).stdout
+
+
 DEPENDENCIES = r'''
 #include "ac_gpu_info.h"
 #include "ac_hw_stage.h"
 #include "ac_cmdbuf.h"
 #include "ac_debug.h"
 #include "ac_mgfx2_regs.h"
+#include "ac_x940_reg_v25.h" /* Baseline functions still use compatibility names. */
 #include "sid.h"
 #include "util/u_math.h"
 #include "compiler/shader_enums.h"
@@ -114,6 +125,7 @@ struct radv_physical_device {struct radeon_info info;};
 struct radv_instance {unsigned debug_flags;};
 #define RADV_DEBUG_NO_ATOC_DITHERING 1
 #define RADV_CMD_DIRTY_GUARDBAND 1
+#define MAX_RTS 8
 #define VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT 0
 #define VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT 1
 struct radeon_winsys_bo {uint64_t va;};
@@ -135,14 +147,16 @@ struct radv_shader {
 };
 struct radv_device {
    struct radv_physical_device *pdev;
+   bool uses_shadow_regs;
    void *ws;
    struct {struct radeon_winsys_bo *bo;} border_color_data;
    struct radeon_winsys_bo *tma_bo;
    struct radv_shader *trap_handler_shader;
 };
 struct radeon_cmdbuf {
-   uint32_t addresses[2048], values[2048]; unsigned count, next, remaining;
+   uint32_t addresses[2048], values[2048], raw[4096]; unsigned count, next, remaining, raw_count;
 };
+struct test_cb_attachment {unsigned write_mask; bool dual_src;};
 struct radv_dynamic_state {
    struct {struct {
       unsigned viewport_count;
@@ -152,18 +166,20 @@ struct radv_dynamic_state {
    } vp;
    struct {unsigned polygon_mode, conservative_mode; struct {float width;} line;} rs;
    struct {bool alpha_to_coverage_enable;} ms;
+   struct {bool logic_op_enable; unsigned logic_op; struct test_cb_attachment attachments[8];} cb;
    } vk;
    struct {struct {float scale[3], translate[3];} xform[16];} hw_vp;
 };
 struct radv_cmd_buffer {
    struct radv_device *device; struct radeon_cmdbuf *cs;
    enum radv_depth_clamp_mode clamp;
-   struct {struct radv_dynamic_state dynamic; struct radv_shader *shaders[16]; unsigned dirty;} state;
+   struct {struct radv_dynamic_state dynamic; struct radv_shader *shaders[16]; unsigned dirty, custom_blend_mode;} state;
 };
-static const struct radv_physical_device *radv_device_physical(const struct radv_device *d) {return d->pdev;}
+static struct radv_physical_device *radv_device_physical(const struct radv_device *d) {return d->pdev;}
 static struct radv_device *radv_cmd_buffer_device(const struct radv_cmd_buffer *c) {return c->device;}
 static struct radv_instance instance;
 static const struct radv_instance *radv_physical_device_instance(const struct radv_physical_device *p) {(void)p; return &instance;}
+static bool radv_can_enable_dual_src(const struct test_cb_attachment *a) {return a->dual_src;}
 static unsigned radv_get_rasterization_prim(struct radv_cmd_buffer *c) {(void)c; return 2;}
 static bool radv_rast_prim_is_point(unsigned p) {return p == 1;}
 static bool radv_rast_prim_is_line(unsigned p) {return p == 2;}
@@ -185,8 +201,17 @@ static void radeon_set_context_reg_seq(struct radeon_cmdbuf *c, unsigned a, unsi
 }
 #define radeon_set_sh_reg_seq radeon_set_context_reg_seq
 #define radeon_set_context_reg write_reg
+#define radeon_set_sh_reg write_reg
+static void radeon_set_sh_reg_idx(const struct radeon_info *i, struct radeon_cmdbuf *c,
+                                 unsigned a, unsigned index, uint32_t v) {
+   (void)i; (void)index; write_reg(c, a, v);
+}
 static void radeon_emit(struct radeon_cmdbuf *c, uint32_t v) {
-   assert(c->remaining); write_reg(c, c->next, v); c->next += 4; c->remaining--;
+   if (c->remaining) {
+      write_reg(c, c->next, v); c->next += 4; c->remaining--;
+   } else {
+      assert(c->raw_count < ARRAY_SIZE(c->raw)); c->raw[c->raw_count++] = v;
+   }
 }
 static void radv_emit_shader_pointer(struct radv_device *d, struct radeon_cmdbuf *c, unsigned a, uint64_t v, bool global) {
    (void)d; assert(global); write_reg(c, a, v); write_reg(c, a + 4, v >> 32);
@@ -198,7 +223,19 @@ static void radeon_opt_set_context_reg2(struct radv_cmd_buffer *c, unsigned a, u
    radeon_opt_set_context_reg(c, a, track, x); write_reg(c->cs, a + 4, y);
 }
 static void radeon_emit_array(struct radeon_cmdbuf *c, const uint32_t *dw, unsigned n) {
-   for (unsigned i = 0; i < n; i++) write_reg(c, 0, dw[i]);
+   assert(c->raw_count + n <= ARRAY_SIZE(c->raw));
+   memcpy(c->raw + c->raw_count, dw, n * sizeof(*dw)); c->raw_count += n;
+   for (unsigned pos = 0; pos < n;) {
+      unsigned h = dw[pos], size = ((h >> 16) & 0x3fff) + 2, op = (h >> 8) & 255;
+      assert(h >> 30 == 3 && pos + size <= n);
+      unsigned base = op == 0x68 ? 0x8000 : op == 0x69 ? 0x28000 :
+                      (op == 0x76 || op == 0x9b) ? 0xb000 :
+                      (op == 0x79 || op == 0x7a) ? 0x30000 : 0;
+      if (base)
+         for (unsigned j = 2; j < size; j++)
+            write_reg(c, base + ((dw[pos + 1] & 0xffff) + j - 2) * 4, dw[pos + j]);
+      pos += size;
+   }
 }
 static struct ac_pm4_state *fault_pm4_create(const struct radeon_info *i, bool s, unsigned n, bool c) {
    (void)i;(void)s;(void)n;(void)c; return NULL;
@@ -308,11 +345,32 @@ int main(void) {
          assert(cs.count == 1 && cs.addresses[0] == K_DB_ALPHA_TO_MASK && cs.values[0] == enable);
       }
    }
+   for (unsigned mode = 0; mode < 8; ++mode) {
+      for (unsigned flags = 0; flags < 16; ++flags) {
+         cmd.state.custom_blend_mode = mode;
+         pdev.info.has_rbplus = flags & 1;
+         cmd.state.dynamic.vk.cb.logic_op_enable = flags & 2;
+         cmd.state.dynamic.vk.cb.logic_op = 0x5a;
+         cmd.state.dynamic.vk.cb.attachments[0].dual_src = flags & 4;
+         cmd.state.dynamic.vk.cb.attachments[7].write_mask = (flags & 8) ? 0xf : 0;
+         cs = (struct radeon_cmdbuf){0};
+         radv_emit_logic_op(&cmd);
+         assert(cs.count == 1 && cs.addresses[0] == K_CB_COLOR_CONTROL);
+         unsigned expected = S_028808_ROP3((flags & 2) ? 0x5a : V_028808_ROP3_COPY);
+         expected |= S_028808_MODE(mode ? mode : ((flags & 8) ? V_028808_CB_NORMAL : V_028808_CB_DISABLE));
+         if (flags & 1)
+            expected |= S_028808_DISABLE_DUAL_QUAD((flags & 6) || mode == V_028808_CB_RESOLVE);
+         assert(cs.values[0] == expected);
+      }
+   }
    const enum amd_gfx_level levels[] = {GFX8, GFX9, GFX10, GFX10_3, GFX11, GFX11_5, GFX12};
    pdev.info.is_xclipse940 = false;
    baseline_cmd.state = cmd.state;
    for (unsigned i = 0; i < ARRAY_SIZE(levels); ++i) {
       pdev.info.gfx_level = levels[i];
+      cs = (struct radeon_cmdbuf){0}; baseline_cs = (struct radeon_cmdbuf){0};
+      radv_emit_logic_op(&cmd); radv_emit_logic_op_baseline(&baseline_cmd);
+      assert(!memcmp(&cs, &baseline_cs, sizeof(cs)));
       cs = (struct radeon_cmdbuf){0}; baseline_cs = (struct radeon_cmdbuf){0};
       radv_emit_graphics_shader_pointers(&device, &cs, &bo);
       radv_emit_graphics_shader_pointers_baseline(&device, &baseline_cs, &bo);
@@ -336,7 +394,7 @@ int main(void) {
       assert(!memcmp(&cs, &baseline_cs, sizeof(cs)));
    }
    cs = (struct radeon_cmdbuf){0};
-   assert(radv_emit_compute(&device, &cs, true) == VK_ERROR_OUT_OF_HOST_MEMORY);
+   assert(radv_emit_compute_fault(&device, &cs, true) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!cs.count);
    struct radeon_winsys_bo old_gds, old_oa, new_gds, new_oa;
    struct cleanup_queue queue = {.gds_bo = &old_gds, .gds_oa_bo = &old_oa};
@@ -352,7 +410,49 @@ int main(void) {
    release_count = destroy_count = 0;
    run_failure_cleanup(&queue, &device, &old_gds, &old_oa, 3);
    assert(!release_count && !destroy_count);
-   puts("RADV: pointers, NGG/HS metadata, fragment writes, 1..16 viewports, guardband, conservative raster, alpha-to-mask, AMD regression and allocation failure: OK");
+   puts("RADV: pointers, NGG/HS metadata, fragment writes, 1..16 viewports, guardband, conservative raster, alpha-to-mask, 128 color-control cases, AMD regression and allocation failure: OK");
+   pdev.info.gfx_level = GFX10_3;
+   pdev.info.is_xclipse940 = true;
+   device.uses_shadow_regs = false;
+   cs = (struct radeon_cmdbuf){0};
+   assert(radv_emit_graphics_fault(&device, &cs) == VK_ERROR_OUT_OF_HOST_MEMORY);
+   assert(cs.count == 0); /* Callers discard any control-only failed preamble. */
+   for (unsigned clear = 0; clear < 2; ++clear) {
+      for (unsigned defaults = 0; defaults < 2; ++defaults) {
+         pdev.info.has_clear_state = clear;
+         if (defaults) setenv("RADV_X940_DIAG_CONTEXT_DEFAULTS_V26", "1", 1);
+         else unsetenv("RADV_X940_DIAG_CONTEXT_DEFAULTS_V26");
+         cs = (struct radeon_cmdbuf){0};
+         assert(radv_emit_graphics(&device, &cs) == VK_SUCCESS);
+         unsigned zregs = 0;
+         for (unsigned j = 0; j < cs.count; ++j) {
+            unsigned addr = cs.addresses[j];
+            assert(!(addr >= 0xb100 && addr < 0xb200));
+            for (unsigned v = 0; v < 16; ++v) {
+               if (addr == K_PA_SC_VPORT_ZMIN_0 + v * 0x20) {
+                  assert(cs.values[j] == 0); zregs++;
+               }
+               if (addr == K_PA_SC_VPORT_ZMAX_0 + v * 0x20) {
+                  assert(cs.values[j] == fui(1.0f)); zregs++;
+               }
+            }
+         }
+         assert(zregs == ((!clear || defaults) ? 32 : 0));
+      }
+   }
+   unsetenv("RADV_X940_DIAG_CONTEXT_DEFAULTS_V26");
+   pdev.info.is_xclipse940 = false;
+   for (unsigned i = 2; i < ARRAY_SIZE(levels); ++i) {
+      pdev.info.gfx_level = levels[i];
+      for (unsigned clear = 0; clear < 2; ++clear) {
+         pdev.info.has_clear_state = clear;
+         cs = (struct radeon_cmdbuf){0}; baseline_cs = (struct radeon_cmdbuf){0};
+         assert(radv_emit_graphics(&device, &cs) == VK_SUCCESS);
+         radv_emit_graphics_baseline(&device, &baseline_cs);
+         assert(!memcmp(&cs, &baseline_cs, sizeof(cs)));
+      }
+   }
+   puts("Queue graphics preamble: V26 defaults, allocation failure and AMD regression: OK");
    puts("GDS/OA failure cleanup: release only newly resident BOs; preserve old BOs: OK");
 }
 '''
@@ -369,16 +469,9 @@ def main():
     args = parser.parse_args()
     root = args.root.resolve()
     mapping = kernel_map(args.offset_header, args.ip_header)
-    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     with tempfile.TemporaryDirectory(prefix="x940-emission-test-") as tmp:
         tmp = Path(tmp)
-        meson = (root / "src/amd/common/meson.build").read_text()
-        json_list = re.search(r"amd_json_files\s*=\s*\[(.*?)\n\]", meson, re.S)[1]
-        json_files = re.findall(r"'([^']+\.json)'", json_list)
-        generated = run([sys.executable, "-B", str(root / "src/amd/registers/makeregheader.py"),
-             "--sort", "address", "--guard", "AMDGFXREGS_H",
-             *(str(root / "src/amd/common" / name) for name in json_files)], env=env).stdout
-        (tmp / "amdgfxregs.h").write_text(generated)
+        (tmp / "amdgfxregs.h").write_text(generate_amd_header(root))
         masks = numeric_defines(args.mask_header)
         field_checks = []
         cmd_source = (root / "src/amd/vulkan/radv_cmd_buffer.c").read_text()
@@ -389,7 +482,7 @@ def main():
             "02842C": "DB_STENCIL_CONTROL", "028430": "DB_STENCILREFMASK",
             "028434": "DB_STENCILREFMASK_BF", "028C4C": "PA_SC_CONSERVATIVE_RASTERIZATION_CNTL",
             "028B6C": "VGT_TF_PARAM", "00B324": "SPI_SHADER_PGM_HI_ES",
-            "030984": "VGT_TF_MEMORY_BASE_HI",
+            "030984": "VGT_TF_MEMORY_BASE_HI", "028808": "CB_COLOR_CONTROL",
         }
         inactive_fields = {("028644", "PRIM_ATTR")}  # GFX11 per-primitive path, not MGFX2/GFX10.3.
         for prefix, reg in field_groups.items():
@@ -449,7 +542,8 @@ def main():
         test = helpers + RADV_MODEL + check_fields
         for name, text in (("radv_emit_graphics_shader_pointers", queue), ("radv_emit_fragment_shader", cmd),
                            ("radv_emit_viewport", cmd), ("radv_emit_guardband_state", cmd),
-                           ("radv_emit_conservative_rast_mode", cmd), ("radv_emit_alpha_to_coverage_enable", cmd)):
+                           ("radv_emit_conservative_rast_mode", cmd), ("radv_emit_alpha_to_coverage_enable", cmd),
+                           ("radv_emit_logic_op", cmd)):
             test += "\n" + function(text, name)
             old = run(["git", "show", f"{args.baseline_ref}:src/amd/vulkan/" + ("radv_queue.c" if text == queue else "radv_cmd_buffer.c")], cwd=root).stdout
             test += "\n" + function(old, name).replace(name + "(", name + "_baseline(", 1)
@@ -457,7 +551,17 @@ def main():
         viewport_helpers = function(cmd, "radv_get_viewport_zscale_ztranslate") + "\n" + function(cmd, "radv_get_viewport_zmin_zmax")
         test = test.replace(function(cmd, "radv_emit_viewport"), viewport_helpers + "\n" + function(cmd, "radv_emit_viewport"), 1)
         test += "\n" + function(shader, "radv_precompute_registers_pgm")
-        test += "\n#define ac_pm4_create_sized fault_pm4_create\n" + function(queue, "radv_emit_compute") + "\n#undef ac_pm4_create_sized\n"
+        test += "\n" + function(queue, "radv_pack_float_12p4")
+        test += "\n" + function(queue, "radv_emit_compute")
+        test += "\n" + function(queue, "radv_emit_graphics")
+        test += "\n#define ac_pm4_create_sized fault_pm4_create\n"
+        for name in ("radv_emit_compute", "radv_emit_graphics"):
+            test += function(queue, name).replace(name + "(", name + "_fault(", 1) + "\n"
+        test += "\n#undef ac_pm4_create_sized\n"
+        old_queue = run(["git", "show", f"{args.baseline_ref}:src/amd/vulkan/radv_queue.c"], cwd=root).stdout
+        test += "\n" + function(old_queue, "radv_emit_compute").replace("radv_emit_compute(", "radv_emit_compute_baseline(")
+        test += "\n" + function(old_queue, "radv_emit_graphics").replace("radv_emit_graphics(", "radv_emit_graphics_baseline(").replace("radv_emit_compute(", "radv_emit_compute_baseline(")
+
         # Compile the real failure block, with fake BOs and residency callbacks.
         cleanup = function(queue, "radv_update_preamble_cs").split("\nfail:\n", 1)[1]
         test += r'''
