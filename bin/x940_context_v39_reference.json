@@ -1,0 +1,284 @@
+{
+  "profile": "v38-stock-initialized-context",
+  "stock_hal_sha256": "e3eacfdf52904bbb81d1dbbbd343bc352ee6d1c62d8eae71618615908d25cd3a",
+  "context_snapshot_sha256": "6029e1cb61e43a9e61ddf14eebf9234114fc5cbcb680dfd893ae2c0dfd8b7847",
+  "hardware_readback": false,
+  "image_bytes": 4096,
+  "register_count": 614,
+  "ranges_dw": [
+    [
+      0,
+      36
+    ],
+    [
+      122,
+      94
+    ],
+    [
+      221,
+      7
+    ],
+    [
+      250,
+      2
+    ],
+    [
+      259,
+      194
+    ],
+    [
+      468,
+      20
+    ],
+    [
+      501,
+      4
+    ],
+    [
+      511,
+      20
+    ],
+    [
+      640,
+      4
+    ],
+    [
+      646,
+      2
+    ],
+    [
+      659,
+      2
+    ],
+    [
+      675,
+      1
+    ],
+    [
+      677,
+      63
+    ],
+    [
+      759,
+      133
+    ],
+    [
+      912,
+      32
+    ]
+  ],
+  "nonzero_defaults": {
+    "0x028034": {
+      "name": "PA_SC_SCREEN_SCISSOR_BR",
+      "value": "0x40004000"
+    },
+    "0x028204": {
+      "name": "PA_SC_WINDOW_SCISSOR_TL",
+      "value": "0x80000000"
+    },
+    "0x028208": {
+      "name": "PA_SC_WINDOW_SCISSOR_BR",
+      "value": "0x40004000"
+    },
+    "0x02820c": {
+      "name": "PA_SC_CLIPRECT_RULE",
+      "value": "0x0000ffff"
+    },
+    "0x028214": {
+      "name": "PA_SC_CLIPRECT_0_BR",
+      "value": "0x40004000"
+    },
+    "0x02821c": {
+      "name": "PA_SC_CLIPRECT_1_BR",
+      "value": "0x40004000"
+    },
+    "0x028224": {
+      "name": "PA_SC_CLIPRECT_2_BR",
+      "value": "0x40004000"
+    },
+    "0x02822c": {
+      "name": "PA_SC_CLIPRECT_3_BR",
+      "value": "0x40004000"
+    },
+    "0x028230": {
+      "name": "PA_SC_EDGERULE",
+      "value": "0xaa99aaaa"
+    },
+    "0x028240": {
+      "name": "PA_SC_GENERIC_SCISSOR_TL",
+      "value": "0x80000000"
+    },
+    "0x028244": {
+      "name": "PA_SC_GENERIC_SCISSOR_BR",
+      "value": "0x40004000"
+    },
+    "0x028250": {
+      "name": "PA_SC_VPORT_SCISSOR_0_TL",
+      "value": "0x80000000"
+    },
+    "0x028254": {
+      "name": "PA_SC_VPORT_SCISSOR_0_BR",
+      "value": "0x40004000"
+    },
+    "0x028258": {
+      "name": "PA_SC_VPORT_SCISSOR_1_TL",
+      "value": "0x80000000"
+    },
+    "0x02825c": {
+      "name": "PA_SC_VPORT_SCISSOR_1_BR",
+      "value": "0x40004000"
+    },
+    "0x028260": {
+      "name": "PA_SC_VPORT_SCISSOR_2_TL",
+      "value": "0x80000000"
+    },
+    "0x028264": {
+      "name": "PA_SC_VPORT_SCISSOR_2_BR",
+      "value": "0x40004000"
+    },
+    "0x028268": {
+      "name": "PA_SC_VPORT_SCISSOR_3_TL",
+      "value": "0x80000000"
+    },
+    "0x02826c": {
+      "name": "PA_SC_VPORT_SCISSOR_3_BR",
+      "value": "0x40004000"
+    },
+    "0x028270": {
+      "name": "PA_SC_VPORT_SCISSOR_4_TL",
+      "value": "0x80000000"
+    },
+    "0x028274": {
+      "name": "PA_SC_VPORT_SCISSOR_4_BR",
+      "value": "0x40004000"
+    },
+    "0x028278": {
+      "name": "PA_SC_VPORT_SCISSOR_5_TL",
+      "value": "0x80000000"
+    },
+    "0x02827c": {
+      "name": "PA_SC_VPORT_SCISSOR_5_BR",
+      "value": "0x40004000"
+    },
+    "0x028280": {
+      "name": "PA_SC_VPORT_SCISSOR_6_TL",
+      "value": "0x80000000"
+    },
+    "0x028284": {
+      "name": "PA_SC_VPORT_SCISSOR_6_BR",
+      "value": "0x40004000"
+    },
+    "0x028288": {
+      "name": "PA_SC_VPORT_SCISSOR_7_TL",
+      "value": "0x80000000"
+    },
+    "0x02828c": {
+      "name": "PA_SC_VPORT_SCISSOR_7_BR",
+      "value": "0x40004000"
+    },
+    "0x028290": {
+      "name": "PA_SC_VPORT_SCISSOR_8_TL",
+      "value": "0x80000000"
+    },
+    "0x028294": {
+      "name": "PA_SC_VPORT_SCISSOR_8_BR",
+      "value": "0x40004000"
+    },
+    "0x028298": {
+      "name": "PA_SC_VPORT_SCISSOR_9_TL",
+      "value": "0x80000000"
+    },
+    "0x02829c": {
+      "name": "PA_SC_VPORT_SCISSOR_9_BR",
+      "value": "0x40004000"
+    },
+    "0x0282a0": {
+      "name": "PA_SC_VPORT_SCISSOR_10_TL",
+      "value": "0x80000000"
+    },
+    "0x0282a4": {
+      "name": "PA_SC_VPORT_SCISSOR_10_BR",
+      "value": "0x40004000"
+    },
+    "0x0282a8": {
+      "name": "PA_SC_VPORT_SCISSOR_11_TL",
+      "value": "0x80000000"
+    },
+    "0x0282ac": {
+      "name": "PA_SC_VPORT_SCISSOR_11_BR",
+      "value": "0x40004000"
+    },
+    "0x0282b0": {
+      "name": "PA_SC_VPORT_SCISSOR_12_TL",
+      "value": "0x80000000"
+    },
+    "0x0282b4": {
+      "name": "PA_SC_VPORT_SCISSOR_12_BR",
+      "value": "0x40004000"
+    },
+    "0x0282b8": {
+      "name": "PA_SC_VPORT_SCISSOR_13_TL",
+      "value": "0x80000000"
+    },
+    "0x0282bc": {
+      "name": "PA_SC_VPORT_SCISSOR_13_BR",
+      "value": "0x40004000"
+    },
+    "0x0282c0": {
+      "name": "PA_SC_VPORT_SCISSOR_14_TL",
+      "value": "0x80000000"
+    },
+    "0x0282c4": {
+      "name": "PA_SC_VPORT_SCISSOR_14_BR",
+      "value": "0x40004000"
+    },
+    "0x0282c8": {
+      "name": "PA_SC_VPORT_SCISSOR_15_TL",
+      "value": "0x80000000"
+    },
+    "0x0282cc": {
+      "name": "PA_SC_VPORT_SCISSOR_15_BR",
+      "value": "0x40004000"
+    },
+    "0x028374": {
+      "name": "CVC_CNTL",
+      "value": "0x83000000"
+    },
+    "0x028410": {
+      "name": "CB_RMI_GL2_CACHE_CONTROL",
+      "value": "0x00550055"
+    },
+    "0x028b50": {
+      "name": "VGT_TESS_DISTRIBUTION",
+      "value": "0xd8181e0c"
+    },
+    "0x028bdc": {
+      "name": "PA_SC_LINE_CNTL",
+      "value": "0x00001000"
+    },
+    "0x028be4": {
+      "name": "PA_SU_VTX_CNTL",
+      "value": "0x00000005"
+    },
+    "0x028c38": {
+      "name": "PA_SC_AA_MASK_X0Y0_X1Y0",
+      "value": "0xffffffff"
+    },
+    "0x028c3c": {
+      "name": "PA_SC_AA_MASK_X0Y1_X1Y1",
+      "value": "0xffffffff"
+    },
+    "0x028c44": {
+      "name": "PA_SC_BINNER_CNTL_0",
+      "value": "0x19fc0c92"
+    },
+    "0x028c4c": {
+      "name": "PA_SC_BINNER_CNTL_2",
+      "value": "0x03e00800"
+    },
+    "0x028c54": {
+      "name": "PA_SC_CONSERVATIVE_RASTERIZATION_CNTL",
+      "value": "0x00100000"
+    }
+  }
+}

@@ -13,6 +13,7 @@
 #include "radv_cp_reg_shadowing.h"
 #include "radv_cs.h"
 #include "ac_mgfx2_regs.h"
+#include "ac_mgfx2_context.h"
 #include "radv_debug.h"
 #include "radv_device_memory.h"
 #include "radv_image.h"
@@ -952,6 +953,20 @@ radv_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
    return radv_emit_compute(device, cs, false);
 }
 
+static void
+radv_emit_mgfx2_context_image(struct radv_device *device, struct radeon_cmdbuf *cs)
+{
+   if (!device->x940_context_image)
+      return;
+
+   assert(radv_device_physical(device)->info.is_xclipse940 && !device->uses_shadow_regs);
+   radv_cs_add_buffer(device->ws, cs, device->x940_context_image);
+   ac_mgfx2_emit_context_image(radv_buffer_get_va(device->x940_context_image),
+                               (void (*)(void *, uint32_t))radeon_emit, cs);
+   fprintf(stderr, "x940-context-init: method=load_context_image_v39 ranges=15 registers=614 "
+                   "shadow=0 preemption=0 uconfig_load=0 sh_load=0\n");
+}
+
 static VkResult
 radv_init_graphics_state(struct radeon_cmdbuf *cs, struct radv_device *device)
 {
@@ -1169,7 +1184,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
          goto fail;
       }
 
-      radeon_check_space(ws, cs, 512);
+      radeon_check_space(ws, cs, 512 + (device->x940_context_image && i < 2 ? AC_MGFX2_CONTEXT_LOAD_DWORDS : 0));
       dest_cs[i] = cs;
 
       if (scratch_bo)
@@ -1178,6 +1193,11 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
       /* Emit initial configuration. */
       switch (queue->qf) {
       case RADV_QUEUE_GENERAL:
+         /* Reset defaults only at a submission boundary. A continue preamble
+          * can resume the same command buffer without re-emitting draw state.
+          */
+         if (i < 2)
+            radv_emit_mgfx2_context_image(device, cs);
          if (queue->uses_shadow_regs)
             radv_emit_shadow_regs_preamble(cs, device, queue);
          result = radv_init_graphics_state(cs, device);

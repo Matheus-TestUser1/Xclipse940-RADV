@@ -411,6 +411,9 @@ struct radv_device {
    uint32_t gfx_init_size_dw;
    struct radeon_winsys_bo *gfx_init;
 
+   /* Immutable CPU-uploaded MGFX2 defaults. Opt-in diagnostic; no shadowing. */
+   struct radeon_winsys_bo *x940_context_image;
+
    struct radeon_winsys_bo *trace_bo;
    struct radv_trace_data *trace_data;
 
