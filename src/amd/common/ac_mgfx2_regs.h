@@ -12,7 +12,24 @@
 #include <stdint.h>
 
 enum ac_mgfx2_reg {
+   AC_MGFX2_CB_COLOR0_BASE = 0x028c60u,
+   AC_MGFX2_CB_COLOR0_CLEAR_WORD0 = 0x028da0u,
+   AC_MGFX2_CB_COLOR0_BASE_EXT = 0x028e40u,
+   AC_MGFX2_CB_COLOR0_CMASK_BASE_EXT = 0x028e60u,
+   AC_MGFX2_CB_COLOR0_FMASK_BASE_EXT = 0x028e80u,
+   AC_MGFX2_CB_COLOR0_DCC_BASE_EXT = 0x028ea0u,
+   AC_MGFX2_DB_HTILE_DATA_BASE = 0x028038u,
+   AC_MGFX2_DB_DEPTH_SIZE_XY = 0x02803cu,
+   AC_MGFX2_DB_DEPTH_VIEW = 0x028058u,
+   AC_MGFX2_DB_HTILE_SURFACE = 0x028060u,
+   AC_MGFX2_DB_STENCIL_WRITE_BASE_HI = 0x028074u,
+   AC_MGFX2_DB_HTILE_DATA_BASE_HI = 0x028078u,
+   AC_MGFX2_DB_Z_READ_BASE_HI = 0x02807cu,
+   AC_MGFX2_DB_Z_WRITE_BASE_HI = 0x028088u,
+   AC_MGFX2_DB_STENCIL_READ_BASE_HI = 0x02808cu,
+   AC_MGFX2_DB_Z_INFO = 0x028040u,
    AC_MGFX2_CB_COLOR0_INFO = 0x028d80u,
+   AC_MGFX2_CB_COLOR_CONTROL = 0x028de0u,
    AC_MGFX2_CB_SHADER_MASK = 0x028decu,
    AC_MGFX2_DB_EQAA = 0x02806cu,
    AC_MGFX2_DB_RENDER_CONTROL = 0x028064u,
@@ -86,6 +103,35 @@ static inline unsigned
 ac_mgfx2_reg(bool is_xclipse940, unsigned amd_reg, enum ac_mgfx2_reg mgfx2_reg)
 {
    return is_xclipse940 ? mgfx2_reg : amd_reg;
+}
+
+/* MGFX2 stores nine CB registers per MRT and clear words in a separate array. */
+static inline unsigned
+ac_mgfx2_cb_color_base(unsigned index)
+{
+   assert(index < 8);
+   return AC_MGFX2_CB_COLOR0_BASE + index * 0x24;
+}
+
+static inline unsigned
+ac_mgfx2_cb_clear_word0(unsigned index)
+{
+   assert(index < 8);
+   return AC_MGFX2_CB_COLOR0_CLEAR_WORD0 + index * 8;
+}
+
+static inline uint32_t
+ac_mgfx2_cb_attrib(uint32_t gfx10_attrib)
+{
+   /* Samples, fragments and the three retained flags move from bits 12..19. */
+   return (gfx10_attrib >> 12) & 0xffu;
+}
+
+static inline uint32_t
+ac_mgfx2_cb_attrib3(uint32_t gfx10_attrib3)
+{
+   /* MGFX2 does not define GFX10 RESOURCE_LEVEL in bits 27..29. */
+   return gfx10_attrib3 & ~0x38000000u;
 }
 
 struct ac_mgfx2_pgm_regs {
