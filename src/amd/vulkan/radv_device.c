@@ -64,6 +64,7 @@ typedef void *drmDevicePtr;
 #include "git_sha1.h"
 #include "sid.h"
 #include "ac_mgfx2_regs.h"
+#include "ac_mgfx2_context.h"
 #include "vk_common_entrypoints.h"
 #include "vk_format.h"
 #include "vk_sync.h"
@@ -886,6 +887,57 @@ radv_device_init_cache_key(struct radv_device *device)
 }
 
 static void
+radv_device_finish_mgfx2_context_image(struct radv_device *device)
+{
+   if (device->x940_context_image) {
+      radv_bo_destroy(device, NULL, device->x940_context_image);
+      device->x940_context_image = NULL;
+   }
+}
+
+static VkResult
+radv_device_init_mgfx2_context_image(struct radv_device *device)
+{
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   if (!pdev->info.is_xclipse940 || !debug_get_bool_option("RADV_X940_DIAG_CONTEXT_IMAGE_V39", false))
+      return VK_SUCCESS;
+
+   /* The generic GFX10.3 shadow defaults/ranges are not MGFX2. Do not combine
+    * this immutable initialization image with that save/restore mechanism.
+    */
+   if (device->uses_shadow_regs) {
+      fprintf(stderr, "x940-context-image: incompatible with register shadowing; device creation rejected\n");
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+
+   VkResult result = radv_bo_create(
+      device, NULL, AC_MGFX2_CONTEXT_IMAGE_BYTES, 4096, RADEON_DOMAIN_GTT,
+      RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_READ_ONLY | RADEON_FLAG_GTT_WC,
+      RADV_BO_PRIORITY_CS, 0, true, &device->x940_context_image);
+   if (result != VK_SUCCESS)
+      return result;
+
+   void *map = radv_buffer_map(device->ws, device->x940_context_image);
+   if (!map) {
+      radv_device_finish_mgfx2_context_image(device);
+      return VK_ERROR_MEMORY_MAP_FAILED;
+   }
+   memcpy(map, ac_mgfx2_context_image, AC_MGFX2_CONTEXT_IMAGE_BYTES);
+
+   if (getenv("RADV_X940_DIAG_DUMP_GFX_PREAMBLE")) {
+      const uint32_t *words = map;
+      fprintf(stderr, "x940-context-image: begin va=0x%016llx bytes=%u ranges=15 registers=614 words=%u\n",
+              (unsigned long long)radv_buffer_get_va(device->x940_context_image),
+              AC_MGFX2_CONTEXT_IMAGE_BYTES, AC_MGFX2_CONTEXT_IMAGE_DWORDS);
+      for (unsigned i = 0; i < AC_MGFX2_CONTEXT_IMAGE_DWORDS; i++)
+         fprintf(stderr, "0x%08x\n", words[i]);
+      fprintf(stderr, "x940-context-image: end\n");
+   }
+   device->ws->buffer_unmap(device->ws, device->x940_context_image, false);
+   return VK_SUCCESS;
+}
+
+static void
 radv_create_gfx_preamble(struct radv_device *device)
 {
    struct radeon_cmdbuf *cs = device->ws->cs_create(device->ws, AMD_IP_GFX, false);
@@ -1155,6 +1207,10 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    if (pdev->info.register_shadowing_required || instance->debug_flags & RADV_DEBUG_SHADOW_REGS)
       device->uses_shadow_regs = true;
 
+   result = radv_device_init_mgfx2_context_image(device);
+   if (result != VK_SUCCESS)
+      goto fail_queue;
+
    /* Create one context per queue priority. */
    for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
       const VkDeviceQueueCreateInfo *queue_create = &pCreateInfo->pQueueCreateInfos[i];
@@ -1378,6 +1434,8 @@ fail_queue:
          device->ws->ctx_destroy(device->hw_ctx[i]);
    }
 
+   radv_device_finish_mgfx2_context_image(device);
+
    radv_destroy_shader_arenas(device);
 
    _mesa_hash_table_destroy(device->rt_handles, NULL);
@@ -1426,6 +1484,8 @@ radv_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       radv_queue_finish(device->private_sdma_queue);
       vk_free(&device->vk.alloc, device->private_sdma_queue);
    }
+
+   radv_device_finish_mgfx2_context_image(device);
 
    _mesa_hash_table_destroy(device->rt_handles, NULL);
 
