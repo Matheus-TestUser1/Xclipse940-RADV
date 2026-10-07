@@ -12,8 +12,7 @@
 #include "radv_amdgpu_bo.h"
 #include "radv_debug.h"
 #include "drm-uapi/amdgpu_drm.h"
-#include <sys/mman.h>
-#include <errno.h>
+#include "xf86drm.h"
 
 #include "util/os_time.h"
 #include "util/u_atomic.h"
@@ -559,6 +558,7 @@ static void *
 radv_amdgpu_winsys_bo_map(struct radeon_winsys *_ws, struct radeon_winsys_bo *_bo, bool use_fixed_addr,
                           void *fixed_addr)
 {
+   struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
    struct radv_amdgpu_winsys_bo *bo = radv_amdgpu_winsys_bo(_bo);
 
    /* Safeguard for the Quantic Dream layer skipping unmaps. */
@@ -567,20 +567,20 @@ radv_amdgpu_winsys_bo_map(struct radeon_winsys *_ws, struct radeon_winsys_bo *_b
 
    assert(!bo->cpu_map);
 
-   void *data = NULL;
-   int ret = amdgpu_bo_cpu_map(bo->bo, &data);
-   if (ret == 0 && data) {
-      uintptr_t page_start = (uintptr_t)data & ~((uintptr_t)4095);
-      if (mprotect((void *)page_start, bo->base.size, PROT_READ | PROT_WRITE) != 0) {
-         fprintf(stderr, "sgpu: mprotect failed! errno=%d\n", errno);
-      }
-   }
-   if (ret || !data)
+   /* Own the mapping here, as unmap/reserve and BO destruction use munmap/mmap. */
+   union drm_amdgpu_gem_mmap args = {0};
+   args.in.handle = bo->bo_handle;
+   int ret = drmCommandWriteRead(ws->fd, DRM_AMDGPU_GEM_MMAP, &args, sizeof(args));
+   if (ret)
+      return NULL;
+
+   void *data = mmap(fixed_addr, bo->base.size, PROT_READ | PROT_WRITE,
+                     MAP_SHARED | (use_fixed_addr ? MAP_FIXED : 0), ws->fd, args.out.addr_ptr);
+   if (data == MAP_FAILED)
       return NULL;
 
    bo->cpu_map = data;
    return data;
-
 }
 
 static void
