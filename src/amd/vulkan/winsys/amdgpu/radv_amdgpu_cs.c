@@ -1291,8 +1291,12 @@ radv_amdgpu_cs_submit_zero(struct radv_amdgpu_ctx *ctx, enum amd_ip_type ip_type
             return VK_ERROR_DEVICE_LOST;
          }
 
-         sync_accumulate("radv", &fd, fd2);
+         ret = sync_accumulate("radv", &fd, fd2);
          close(fd2);
+         if (ret < 0) {
+            close(fd);
+            return VK_ERROR_DEVICE_LOST;
+         }
       }
 
       for (unsigned i = 0; i < sem_info->wait.timeline_syncobj_count; ++i) {
@@ -1319,8 +1323,12 @@ radv_amdgpu_cs_submit_zero(struct radv_amdgpu_ctx *ctx, enum amd_ip_type ip_type
             return VK_ERROR_DEVICE_LOST;
          }
 
-         sync_accumulate("radv", &fd, fd2);
+         ret = sync_accumulate("radv", &fd, fd2);
          close(fd2);
+         if (ret < 0) {
+            close(fd);
+            return VK_ERROR_DEVICE_LOST;
+         }
       }
 
       ret = amdgpu_cs_syncobj_import_sync_file(ctx->ws->dev, queue_syncobj, fd);
@@ -1365,6 +1373,7 @@ radv_amdgpu_cs_submit_zero(struct radv_amdgpu_ctx *ctx, enum amd_ip_type ip_type
 
    return VK_SUCCESS;
 }
+
 static VkResult
 radv_amdgpu_winsys_cs_submit(struct radeon_winsys_ctx *_ctx, const struct radv_winsys_submit_info *submit,
                              uint32_t wait_count, const struct vk_sync_wait *waits, uint32_t signal_count,
