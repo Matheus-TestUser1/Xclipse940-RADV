@@ -56,21 +56,11 @@ bo_comparator(const void *ap, const void *bp)
    return (a > b) ? 1 : (a < b) ? -1 : 0;
 }
 
-static VkResult
+static void
 radv_amdgpu_winsys_rebuild_bo_list(struct radv_amdgpu_winsys_bo *bo)
 {
    u_rwlock_wrlock(&bo->lock);
-
-   if (bo->bo_capacity < bo->range_count) {
-      uint32_t new_count = MAX2(bo->bo_capacity * 2, bo->range_count);
-      struct radv_amdgpu_winsys_bo **bos = realloc(bo->bos, new_count * sizeof(struct radv_amdgpu_winsys_bo *));
-      if (!bos) {
-         u_rwlock_wrunlock(&bo->lock);
-         return VK_ERROR_OUT_OF_HOST_MEMORY;
-      }
-      bo->bos = bos;
-      bo->bo_capacity = new_count;
-   }
+   assert(bo->bo_capacity >= bo->range_count);
 
    uint32_t temp_bo_count = 0;
    for (uint32_t i = 0; i < bo->range_count; ++i)
@@ -91,7 +81,6 @@ radv_amdgpu_winsys_rebuild_bo_list(struct radv_amdgpu_winsys_bo *bo)
    }
 
    u_rwlock_wrunlock(&bo->lock);
-   return VK_SUCCESS;
 }
 
 static VkResult
@@ -104,11 +93,36 @@ radv_amdgpu_winsys_bo_virtual_bind(struct radeon_winsys *_ws, struct radeon_wins
    int range_count_delta, new_idx;
    int first = 0, last;
    struct radv_amdgpu_map_range new_first, new_last;
-   VkResult result;
    int r;
 
    assert(parent->is_virtual);
    assert(!bo || !bo->is_virtual);
+
+   /* Reserve both tracking arrays before changing GPU mappings. A bind can
+    * add at most two ranges; rebuilding its BO list must not fail afterwards.
+    */
+   const uint32_t max_range_count = parent->range_count + 2;
+   if (parent->range_capacity < max_range_count) {
+      struct radv_amdgpu_map_range *ranges =
+         realloc(parent->ranges, max_range_count * sizeof(struct radv_amdgpu_map_range));
+      if (!ranges)
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      parent->ranges = ranges;
+      parent->range_capacity = max_range_count;
+   }
+
+   u_rwlock_wrlock(&parent->lock);
+   if (parent->bo_capacity < max_range_count) {
+      uint32_t bo_capacity = MAX2(parent->bo_capacity * 2, max_range_count);
+      struct radv_amdgpu_winsys_bo **bos = realloc(parent->bos, bo_capacity * sizeof(*bos));
+      if (!bos) {
+         u_rwlock_wrunlock(&parent->lock);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      parent->bos = bos;
+      parent->bo_capacity = bo_capacity;
+   }
+   u_rwlock_wrunlock(&parent->lock);
 
    /* When the BO is NULL, AMDGPU will reset the PTE VA range to the initial state. Otherwise, it
     * will first unmap all existing VA that overlap the requested range and then map.
@@ -138,18 +152,6 @@ radv_amdgpu_winsys_bo_virtual_bind(struct radeon_winsys *_ws, struct radeon_wins
    if (bo && radv_buffer_is_resident(&bo->base)) {
       bo = NULL;
       bo_offset = 0;
-   }
-
-   /* We have at most 2 new ranges (1 by the bind, and another one by splitting a range that
-    * contains the newly bound range). */
-   if (parent->range_capacity - parent->range_count < 2) {
-      uint32_t range_capacity = parent->range_capacity + 2;
-      struct radv_amdgpu_map_range *ranges =
-         realloc(parent->ranges, range_capacity * sizeof(struct radv_amdgpu_map_range));
-      if (!ranges)
-         return VK_ERROR_OUT_OF_HOST_MEMORY;
-      parent->ranges = ranges;
-      parent->range_capacity = range_capacity;
    }
 
    /*
@@ -231,9 +233,7 @@ radv_amdgpu_winsys_bo_virtual_bind(struct radeon_winsys *_ws, struct radeon_wins
 
    parent->range_count += range_count_delta;
 
-   result = radv_amdgpu_winsys_rebuild_bo_list(parent);
-   if (result != VK_SUCCESS)
-      return result;
+   radv_amdgpu_winsys_rebuild_bo_list(parent);
 
    return VK_SUCCESS;
 }
