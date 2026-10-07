@@ -1925,6 +1925,7 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
    void *wait_syncobj = NULL, *signal_syncobj = NULL;
    int i;
    VkResult result = VK_SUCCESS;
+   bool emitted_wait = false;
    bool has_user_fence = radv_amdgpu_cs_has_user_fence(request);
 
    /* V30 diagnostic: keep Vulkan syncobjs and KMD sequence fences, but omit
@@ -2023,8 +2024,7 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
       }
       num_chunks++;
 
-      sem_info->cs_emit_wait = false;
-      *queue_syncobj_wait = false;
+      emitted_wait = true;
    }
 
    if (sem_info->cs_emit_signal) {
@@ -2100,6 +2100,14 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
          }
       }
    } while (r == -ENOMEM && os_time_get_nano() < abs_timeout_ns);
+
+   /* A failed allocation or rejected submission has not consumed the waits.
+    * Keep them pending until the kernel accepts the request.
+    */
+   if (!r && emitted_wait) {
+      sem_info->cs_emit_wait = false;
+      *queue_syncobj_wait = false;
+   }
 
    if (!r && ctx->ws->info.is_xclipse940 &&
        getenv("RADV_X940_DIAG_RAW_FENCE")) {
