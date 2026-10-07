@@ -389,31 +389,38 @@ radv_amdgpu_cs_grow(struct radeon_cmdbuf *_cs, size_t min_size)
 
    const uint32_t ib_alignment = cs->ws->info.ip[cs->hw_ip].ib_alignment;
 
-   cs->ws->base.cs_finalize(_cs);
+   VkResult result = cs->ws->base.cs_finalize(_cs);
+   if (result != VK_SUCCESS) {
+      cs->base.cdw = 0;
+      return;
+   }
 
    uint64_t ib_size = MAX2(min_size * 4 + 16, cs->base.max_dw * 4 * 2);
 
    ib_size = align(MIN2(ib_size, ~C_3F2_IB_SIZE), ib_alignment);
 
-   VkResult result = radv_amdgpu_cs_bo_create(cs, ib_size);
+   result = radv_amdgpu_cs_bo_create(cs, ib_size);
 
    if (result != VK_SUCCESS) {
       cs->base.cdw = 0;
-      cs->status = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      cs->status = result;
       radv_amdgpu_restore_last_ib(cs);
+      return;
    }
 
-   cs->ib_mapped = radv_buffer_map(&cs->ws->base, cs->ib_buffer);
-   fprintf(stderr, "sgpu: ib_mapped=%p bo_va=0x%lx\n", cs->ib_mapped, radv_amdgpu_winsys_bo(cs->ib_buffer)->base.va);
-   if (!cs->ib_mapped) {
+   uint8_t *ib_mapped = radv_buffer_map(&cs->ws->base, cs->ib_buffer);
+   fprintf(stderr, "sgpu: ib_mapped=%p bo_va=0x%lx\n", ib_mapped, radv_amdgpu_winsys_bo(cs->ib_buffer)->base.va);
+   if (!ib_mapped) {
       cs->ws->base.buffer_destroy(&cs->ws->base, cs->ib_buffer);
       cs->base.cdw = 0;
 
       /* VK_ERROR_MEMORY_MAP_FAILED is not valid for vkEndCommandBuffer. */
       cs->status = VK_ERROR_OUT_OF_DEVICE_MEMORY;
       radv_amdgpu_restore_last_ib(cs);
+      return;
    }
 
+   cs->ib_mapped = ib_mapped;
    cs->ws->base.cs_add_buffer(&cs->base, cs->ib_buffer);
 
    if (cs->use_ib) {
@@ -479,6 +486,9 @@ radv_amdgpu_cs_finalize(struct radeon_cmdbuf *_cs)
 {
    struct radv_amdgpu_cs *cs = radv_amdgpu_cs(_cs);
 
+   if (cs->status != VK_SUCCESS)
+      return cs->status;
+
    assert(cs->base.cdw <= cs->base.reserved_dw);
 
    if (cs->use_ib) {
@@ -501,6 +511,8 @@ radv_amdgpu_cs_finalize(struct radeon_cmdbuf *_cs)
    /* Append the current (last) IB to the array of IB buffers. */
    radv_amdgpu_cs_add_ib_buffer(cs, cs->ib_buffer, cs->ib_buffer->va,
                                 cs->use_ib ? G_3F2_IB_SIZE(*cs->ib_size_ptr) : cs->base.cdw);
+   if (cs->status != VK_SUCCESS)
+      return cs->status;
 
    /* Prevent freeing this BO twice. */
    cs->ib_buffer = NULL;
@@ -1107,6 +1119,11 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
 
    u_rwlock_rdlock(&ws->global_bo_list.lock);
 
+   if (!ibs) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail;
+   }
+
    result = radv_amdgpu_get_bo_list(ws, &cs_array[0], cs_count, initial_preamble_cs, initial_preamble_count,
                                     continue_preamble_cs, continue_preamble_count, postamble_cs, postamble_count,
                                     &num_handles, &handles);
@@ -1217,14 +1234,10 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
          goto fail;
    }
 
-   free(request.handles);
-
-   if (result != VK_SUCCESS)
-      goto fail;
-
    radv_assign_last_submit(ctx, &request);
 
 fail:
+   free(handles);
    u_rwlock_rdunlock(&ws->global_bo_list.lock);
    STACK_ARRAY_FINISH(ibs);
    return result;
