@@ -753,9 +753,14 @@ radv_amdgpu_cs_execute_secondary(struct radeon_cmdbuf *_parent, struct radeon_cm
       radv_amdgpu_cs_add_buffer(&parent->base, child->virtual_buffers[i]);
    }
 
+   if (parent->status != VK_SUCCESS)
+      return;
+
    if (use_ib2) {
       if (parent->base.cdw + 4 > parent->base.max_dw)
          radv_amdgpu_cs_grow(&parent->base, 4);
+      if (parent->status != VK_SUCCESS)
+         return;
 
       parent->base.reserved_dw = MAX2(parent->base.reserved_dw, parent->base.cdw + 4);
 
@@ -781,6 +786,8 @@ radv_amdgpu_cs_execute_secondary(struct radeon_cmdbuf *_parent, struct radeon_cm
 
          if (parent->base.cdw + cdw > parent->base.max_dw)
             radv_amdgpu_cs_grow(&parent->base, cdw);
+         if (parent->status != VK_SUCCESS)
+            return;
 
          parent->base.reserved_dw = MAX2(parent->base.reserved_dw, parent->base.cdw + cdw);
 
@@ -847,8 +854,11 @@ radv_amdgpu_cs_chain_dgc_ib(struct radeon_cmdbuf *_cs, uint64_t va, uint32_t cdw
       radeon_emit(&cs->base, trailer_va >> 32);
       radeon_emit_array(&cs->base, chain_data, ARRAY_SIZE(chain_data));
 
+      if (cs->status != VK_SUCCESS)
+         return;
+
       /* Keep pointers for patching later. */
-      uint64_t *ib_va_ptr = (uint64_t *)(cs->base.buf + cs->base.cdw - 3);
+      uint32_t *ib_va_ptr = cs->base.buf + cs->base.cdw - 3;
       uint32_t *ib_size_ptr = cs->base.buf + cs->base.cdw - 1;
 
       /* Writeback L2 because CP isn't coherent with L2 on GFX6-8. */
@@ -863,7 +873,9 @@ radv_amdgpu_cs_chain_dgc_ib(struct radeon_cmdbuf *_cs, uint64_t va, uint32_t cdw
       }
 
       /* Finalize the current CS. */
-      cs->ws->base.cs_finalize(_cs);
+      VkResult result = cs->ws->base.cs_finalize(_cs);
+      if (result != VK_SUCCESS)
+         return;
 
       /* Chain the current CS to the DGC CS. */
       _cs->buf[_cs->cdw - 4] = PKT3(PKT3_INDIRECT_BUFFER, 2, 0);
@@ -874,25 +886,31 @@ radv_amdgpu_cs_chain_dgc_ib(struct radeon_cmdbuf *_cs, uint64_t va, uint32_t cdw
       /* Allocate a new CS BO with initial size. */
       const uint64_t ib_size = radv_amdgpu_cs_get_initial_size(cs->ws, cs->hw_ip);
 
-      VkResult result = radv_amdgpu_cs_bo_create(cs, ib_size);
+      result = radv_amdgpu_cs_bo_create(cs, ib_size);
       if (result != VK_SUCCESS) {
          cs->base.cdw = 0;
          cs->status = result;
+         radv_amdgpu_restore_last_ib(cs);
          return;
       }
 
-      cs->ib_mapped = radv_buffer_map(&cs->ws->base, cs->ib_buffer);
-   fprintf(stderr, "sgpu: ib_mapped=%p bo_va=0x%lx\n", cs->ib_mapped, radv_amdgpu_winsys_bo(cs->ib_buffer)->base.va);
-      if (!cs->ib_mapped) {
+      uint8_t *ib_mapped = radv_buffer_map(&cs->ws->base, cs->ib_buffer);
+      fprintf(stderr, "sgpu: ib_mapped=%p bo_va=0x%lx\n", ib_mapped, radv_amdgpu_winsys_bo(cs->ib_buffer)->base.va);
+      if (!ib_mapped) {
+         cs->ws->base.buffer_destroy(&cs->ws->base, cs->ib_buffer);
          cs->base.cdw = 0;
          cs->status = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+         radv_amdgpu_restore_last_ib(cs);
          return;
       }
 
+      cs->ib_mapped = ib_mapped;
       cs->ws->base.cs_add_buffer(&cs->base, cs->ib_buffer);
 
       /* Chain back the trailer (DGC CS) to the newly created one. */
-      *ib_va_ptr = radv_amdgpu_winsys_bo(cs->ib_buffer)->base.va;
+      const uint64_t ib_va = radv_amdgpu_winsys_bo(cs->ib_buffer)->base.va;
+      ib_va_ptr[0] = ib_va;
+      ib_va_ptr[1] = ib_va >> 32;
       cs->ib_size_ptr = ib_size_ptr;
 
       cs->base.buf = (uint32_t *)cs->ib_mapped;

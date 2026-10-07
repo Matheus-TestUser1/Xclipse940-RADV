@@ -31,10 +31,24 @@ typedef int VkResult;
 #define S_3F2_CHAIN(v) ((v) << 20)
 #define S_3F2_VALID(v) ((v) << 23)
 #define PKT3_INDIRECT_BUFFER 0x3fu
+#define PKT3_WRITE_DATA 0x37u
+#define PKT3_ACQUIRE_MEM 0x58u
+#define PKT3_SHADER_TYPE_S(v) ((v)<<1)
+#define S_370_DST_SEL(v) ((v)<<8)
+#define V_370_MEM 5u
+#define V_370_ME 0u
+#define S_370_WR_CONFIRM(v) ((v)<<20)
+#define S_370_ENGINE_SEL(v) ((v)<<30)
+#define S_0301F0_TC_WB_ACTION_ENA(v) ((v)<<18)
+#define S_0301F0_TC_NC_ACTION_ENA(v) ((v)<<19)
+#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
+#define GFX8 8
+#define GFX9 9
 #define PKT3(op,n,p) (0xc0000000u | ((n) << 16) | ((op) << 8) | (p))
 #define AMDGPU_HW_IP_GFX 0
+#define AMD_IP_GFX AMDGPU_HW_IP_GFX
 #define AMDGPU_IB_FLAG_PREEMPT 1
-#define AMD_NUM_IP_TYPES 1
+#define AMD_NUM_IP_TYPES 2
 #define RADV_MAX_IBS_PER_SUBMIT 192
 struct radeon_cmdbuf {uint64_t cdw, max_dw, reserved_dw; uint32_t *buf;};
 struct radeon_winsys_bo {uint64_t va;};
@@ -45,14 +59,15 @@ struct radv_amdgpu_winsys {
       VkResult (*cs_finalize)(struct radeon_cmdbuf *);
       void (*buffer_destroy)(void *, struct radeon_winsys_bo *);
       void (*cs_add_buffer)(struct radeon_cmdbuf *, struct radeon_winsys_bo *);
+      void (*cs_execute_ib)(struct radeon_cmdbuf *, struct radeon_winsys_bo *, uint64_t, uint32_t, bool);
    } base;
-   struct {struct {unsigned ib_alignment;} ip[1]; uint32_t max_submitted_ibs[1];} info;
+   struct {struct {unsigned ib_alignment;} ip[2]; uint32_t max_submitted_ibs[2]; unsigned gfx_level;} info;
    struct {int lock;} global_bo_list;
 };
 struct radv_amdgpu_cs {
    struct radeon_cmdbuf base;
    struct radv_amdgpu_winsys *ws;
-   struct {uint32_t size;} ib;
+   struct {uint32_t size; uint64_t ib_mc_address;} ib;
    struct radeon_winsys_bo *ib_buffer;
    uint8_t *ib_mapped;
    struct radv_amdgpu_ib *ib_buffers;
@@ -61,7 +76,11 @@ struct radv_amdgpu_cs {
    VkResult status;
    struct radv_amdgpu_cs *chained_to;
    bool use_ib;
+   bool is_secondary;
    unsigned hw_ip;
+   unsigned num_buffers, num_virtual_buffers;
+   struct drm_amdgpu_bo_list_entry *handles;
+   struct radeon_winsys_bo **virtual_buffers;
 };
 struct drm_amdgpu_bo_list_entry {uint32_t bo_handle, bo_priority;};
 struct radv_amdgpu_cs_request {
@@ -73,27 +92,46 @@ struct radv_amdgpu_cs_request {
 struct radv_amdgpu_ctx {int unused;};
 struct radv_winsys_sem_info {int unused;};
 static struct radeon_winsys_bo old_bo = {.va=0x10000}, new_bo = {.va=0x20000};
-static uint32_t old_words[128], new_words[128];
+static uint32_t old_words[128], new_words[128], child_words[128];
 static unsigned creates, maps, destroys, additions, submissions, assignments, handle_frees, stack_frees;
 static VkResult create_failure, submit_failure;
-static bool map_failure, append_failure, stack_failure, list_failure;
+static bool map_failure, append_failure, stack_failure, list_failure, buffer_failure;
 static void *handle_allocation, *stack_allocation;
 static struct radv_amdgpu_cs *radv_amdgpu_cs(struct radeon_cmdbuf *cs) {return (void *)cs;}
 static struct {struct radeon_winsys_bo base;} *radv_amdgpu_winsys_bo(struct radeon_winsys_bo *bo) {return (void *)bo;}
 static uint32_t get_nop_packet(struct radv_amdgpu_cs *cs) {(void)cs; return 0xffff1000;}
 static void radv_amdgpu_winsys_cs_pad(struct radeon_cmdbuf *cs, unsigned leave) {(void)cs; (void)leave;}
 static void radeon_emit_unchecked(struct radeon_cmdbuf *cs, uint32_t word) {cs->buf[cs->cdw++] = word;}
+static void radeon_emit(struct radeon_cmdbuf *cs, uint32_t word) {
+   cs->reserved_dw=MAX2(cs->reserved_dw,cs->cdw+1);
+   radeon_emit_unchecked(cs,word);
+}
+static void radeon_emit_array(struct radeon_cmdbuf *cs, const uint32_t *words, size_t count) {
+   for(size_t i=0;i<count;i++) radeon_emit(cs,words[i]);
+}
+static unsigned radv_amdgpu_cs_get_initial_size(struct radv_amdgpu_winsys *ws, unsigned ip) {
+   (void)ws; (void)ip; return 256;
+}
 static VkResult radv_amdgpu_cs_bo_create(struct radv_amdgpu_cs *cs, uint32_t bytes) {
    creates++; assert(bytes && bytes % 16 == 0); cs->ib_buffer = NULL;
    if (create_failure) return create_failure;
    cs->ib_buffer = &new_bo; return VK_SUCCESS;
 }
 static void *radv_buffer_map(void *ws, struct radeon_winsys_bo *bo) {
-   (void)ws; maps++; assert(bo == &new_bo || bo == &old_bo);
+   (void)ws; maps++;
+   if(bo->va==0x30000) return child_words;
+   assert(bo == &new_bo || bo == &old_bo);
    return map_failure ? NULL : bo == &new_bo ? new_words : old_words + 8;
 }
 static void destroy(void *ws, struct radeon_winsys_bo *bo) {(void)ws; assert(bo == &new_bo); destroys++;}
 static void add(struct radeon_cmdbuf *cs, struct radeon_winsys_bo *bo) {(void)cs; assert(bo == &new_bo); additions++;}
+static void radv_amdgpu_cs_add_buffer_internal(struct radv_amdgpu_cs *cs, uint32_t handle, unsigned priority) {
+   (void)handle; (void)priority;
+   if(buffer_failure) cs->status=VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+static void radv_amdgpu_cs_add_buffer(struct radeon_cmdbuf *cs, struct radeon_winsys_bo *bo) {
+   (void)bo; radv_amdgpu_cs_add_buffer_internal(radv_amdgpu_cs(cs),0,0);
+}
 static void *audit_realloc(void *ptr, size_t size) {return append_failure ? NULL : realloc(ptr,size);}
 static void *audit_malloc(size_t size) {
    assert(!stack_allocation);
@@ -151,14 +189,14 @@ static void init(struct radv_amdgpu_cs *cs, struct radv_amdgpu_winsys *ws, bool 
    cs->ib_size_ptr=&cs->ib.size; cs->use_ib=use_ib;
    creates=maps=destroys=additions=submissions=assignments=handle_frees=stack_frees=0;
    create_failure=submit_failure=VK_SUCCESS;
-   map_failure=append_failure=stack_failure=list_failure=false;
+   map_failure=append_failure=stack_failure=list_failure=buffer_failure=false;
    assert(!handle_allocation && !stack_allocation);
 }
 static void guards(void) {for(unsigned i=0;i<8;i++) assert(old_words[i] == 0xfeedface);}
 int main(void) {
    struct radv_amdgpu_winsys ws = {
       .base={.cs_finalize=radv_amdgpu_cs_finalize,.buffer_destroy=destroy,.cs_add_buffer=add},
-      .info={.ip={{.ib_alignment=16}},.max_submitted_ibs={192}},
+      .info={.ip={{.ib_alignment=16},{.ib_alignment=16}},.max_submitted_ibs={192,192},.gfx_level=GFX9},
    };
    struct radv_amdgpu_cs cs;
    for(unsigned use_ib=0;use_ib<2;use_ib++) {
@@ -195,6 +233,58 @@ int main(void) {
       guards(); free(cs.ib_buffers);
    }
    puts("IB create/map/append failures preserve ownership and stop writes; success chains intact: OK");
+   struct radeon_winsys_bo child_bo={.va=0x30000};
+   struct radv_amdgpu_ib child_ib={.bo=&child_bo,.va=child_bo.va};
+   struct drm_amdgpu_bo_list_entry child_handle={.bo_handle=42};
+   for(unsigned ib2=0;ib2<2;ib2++) {
+      for(unsigned failure=0;failure<5;failure++) {
+         init(&cs,&ws,ib2);
+         cs.base.cdw=cs.base.reserved_dw=64;
+         child_ib.cdw=ib2 ? 4 : 80;
+         for(unsigned i=0;i<128;i++) child_words[i]=i;
+         struct radv_amdgpu_cs child={.use_ib=ib2,.num_ib_buffers=1,.ib_buffers=&child_ib,
+            .num_buffers=1,.handles=&child_handle,.ib={.size=4,.ib_mc_address=child_bo.va}};
+         if(failure==1) create_failure=VK_ERROR_OUT_OF_DEVICE_MEMORY;
+         if(failure==2) map_failure=true;
+         if(failure==3) append_failure=true;
+         if(failure==4) buffer_failure=true;
+         radv_amdgpu_cs_execute_secondary(&cs.base,&child.base,ib2);
+         if(failure) {
+            assert(cs.status!=VK_SUCCESS && !additions);
+            assert(cs.ib_buffer==&old_bo && cs.base.buf==old_words+8);
+            /* No child mapping, copy, or IB2 emission after a failed growth. */
+            assert(maps==(failure==2 ? 1u : 0u));
+            assert(old_words[8]==0xfeedface);
+         } else {
+            assert(cs.status==VK_SUCCESS && cs.ib_buffer==&new_bo && additions==1);
+            if(ib2) assert(cs.base.cdw==4 && new_words[0]==PKT3(PKT3_INDIRECT_BUFFER,2,0));
+            else assert(cs.base.cdw==80 && !memcmp(new_words,child_words,80*sizeof(uint32_t)));
+         }
+         guards(); free(cs.ib_buffers);
+      }
+   }
+   puts("Secondary copy and IB2 paths stop after growth/resource failure; success preserved: OK");
+   for(unsigned failure=0;failure<4;failure++) {
+      init(&cs,&ws,true); cs.hw_ip=1;
+      if(failure==1) create_failure=VK_ERROR_OUT_OF_HOST_MEMORY;
+      if(failure==2) map_failure=true;
+      if(failure==3) append_failure=true;
+      radv_amdgpu_cs_chain_dgc_ib(&cs.base,0x40000,32,0x50000,false);
+      if(failure) {
+         assert(cs.status!=VK_SUCCESS && cs.ib_buffer==&old_bo && !cs.num_ib_buffers);
+         assert(cs.base.buf==old_words+8 && cs.ib_mapped==(void *)(old_words+8) && !additions);
+         assert(creates==(failure==3 ? 0u : 1u));
+         assert(maps==(failure==2 ? 1u : 0u) && destroys==(failure==2 ? 1u : 0u));
+      } else {
+         assert(cs.status==VK_SUCCESS && cs.ib_buffer==&new_bo && cs.num_ib_buffers==1);
+         assert(cs.base.buf==new_words && cs.ib_mapped==(void *)new_words && additions==1);
+         /* The WRITE_DATA patch address starts at a DWORD, not necessarily uint64_t alignment. */
+         assert(old_words[17]==new_bo.va && old_words[18]==0);
+         assert(cs.ib_size_ptr==old_words+19);
+      }
+      guards(); free(cs.ib_buffers);
+   }
+   puts("DGC create/map/finalize failures preserve ownership; unaligned trailer patch is safe: OK");
    struct radv_amdgpu_ctx ctx={0}; struct radv_winsys_sem_info sem={0};
    for(unsigned failure=0;failure<6;failure++) {
       init(&cs,&ws,false);
@@ -226,6 +316,8 @@ def main():
     source = (root / 'src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c').read_text()
     names = ['radv_amdgpu_cs_add_ib_buffer', 'radv_amdgpu_restore_last_ib',
              'radv_amdgpu_cs_finalize', 'radv_amdgpu_cs_grow',
+             'radv_amdgpu_cs_execute_secondary',
+             'radv_amdgpu_cs_chain_dgc_ib',
              'radv_amdgpu_winsys_cs_submit_internal']
     code = MOCKS + '\n' + '\n'.join(function(source, name) for name in names) + '\n' + MAIN
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
